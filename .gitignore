@@ -1,0 +1,13 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+uploads/
+database.json
+*.tar.gz
+*.log
+
+.DS_Store
+Thumbs.db
