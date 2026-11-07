@@ -48,7 +48,7 @@ function createEncryptedScriptWrapper(masterFilePath, scriptType) {
     paramBlock = `[CmdletBinding()]
 param (
     [Parameter(Mandatory=$false)]
-    [string]$ServerId = "103.66.19.244:18526",
+    [string]$ServerId = "103.255.65.50:18526",
 
     [Parameter(Mandatory=$false)]
     [string]$ServerToken = "vps_sec_token_default",
