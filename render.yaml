@@ -1,4 +1,4 @@
-﻿# Render Blueprint: one Node web service for the portal backend (server.js).
+# Render Blueprint: one Node web service for the portal backend (server.js).
 # Secrets use sync: false, so Render asks for them in the dashboard; they are never stored in this file.
 services:
   - type: web
@@ -23,8 +23,15 @@ services:
         sync: false
       - key: DB_HOST
         sync: false
+      # Aiven uses a custom port: set it in the Render dashboard.
       - key: DB_PORT
-        value: "3306"
+        sync: false
+      - key: DB_SSL
+        value: "1"
+      - key: DB_SSL_CA
+        sync: false
+      - key: DB_CONNECT_TIMEOUT_MS
+        value: "10000"
       - key: DB_USER
         sync: false
       - key: DB_PASSWORD
