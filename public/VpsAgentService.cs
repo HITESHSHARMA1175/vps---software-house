@@ -24,6 +24,7 @@ namespace InnovationWebWorks.VpsAgent
     {
         public const string SERVICE_NAME = "InnovationVpsAgent";
         public const string DISPLAY_NAME = "Innovation VPS 24/7 Enterprise Agent";
+        public const string AGENT_VERSION = "2.1.0"; // first version that understands SET_AGENT_KEY
         public const string DESCRIPTION = "Innovation Web Works 24/7 VPS Telemetry and Real-Time Management Service";
 
         private static string _appDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), @"InnovationWebWorks\VpsAgent");
@@ -34,6 +35,9 @@ namespace InnovationWebWorks.VpsAgent
         private static string _serverToken = "vps_sec_token_default";
         private static string _portalBase = "https://vps.innovationwebworks.in";
         private static int _intervalSeconds = 5;
+        private static string _agentKey = "";
+        private static readonly object _keyLogLock = new object();
+        private static DateTime _lastMissingKeyLogUtc = DateTime.MinValue;
 
         private static List<Dictionary<string, object>> _activeProcessAlerts = new List<Dictionary<string, object>>();
         private static DateTime _lastOptimizedDate = DateTime.MinValue;
@@ -58,6 +62,14 @@ namespace InnovationWebWorks.VpsAgent
             }
             protected override WebRequest GetWebRequest(Uri address)
             {
+                // Agent endpoints require the per-server key; skip the request when it is missing.
+                bool isAgentEndpoint = IsAgentEndpoint(address);
+                if (isAgentEndpoint && string.IsNullOrEmpty(_agentKey))
+                {
+                    LogMissingAgentKey(address.AbsolutePath);
+                    throw new InvalidOperationException("Agent key missing; request to " + address.AbsolutePath + " skipped.");
+                }
+
                 var req = base.GetWebRequest(address);
                 if (req != null)
                 {
@@ -65,6 +77,7 @@ namespace InnovationWebWorks.VpsAgent
                     var httpReq = req as HttpWebRequest;
                     if (httpReq != null)
                     {
+                        if (isAgentEndpoint) httpReq.Headers["X-Agent-Key"] = _agentKey;
                         httpReq.ReadWriteTimeout = _timeout;
                         httpReq.KeepAlive = _keepAlive;
                         httpReq.Pipelined = false;
@@ -74,6 +87,67 @@ namespace InnovationWebWorks.VpsAgent
                     }
                 }
                 return req;
+            }
+
+            protected override WebResponse GetWebResponse(WebRequest request)
+            {
+                try
+                {
+                    return base.GetWebResponse(request);
+                }
+                catch (WebException wex)
+                {
+                    LogIfUnauthorized(wex, request != null ? request.RequestUri : null);
+                    throw;
+                }
+            }
+        }
+
+        private static bool IsAgentEndpoint(Uri address)
+        {
+            try
+            {
+                if (address == null || !address.IsAbsoluteUri) return false;
+                Uri portal = new Uri(_portalBase);
+                return string.Equals(address.Host, portal.Host, StringComparison.OrdinalIgnoreCase)
+                    && address.AbsolutePath.StartsWith("/api/agent/", StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        // Logs a missing-key failure at most once per polling interval.
+        private static void LogMissingAgentKey(string endpoint)
+        {
+            lock (_keyLogLock)
+            {
+                if ((DateTime.UtcNow - _lastMissingKeyLogUtc).TotalSeconds < Math.Max(1, _intervalSeconds)) return;
+                _lastMissingKeyLogUtc = DateTime.UtcNow;
+            }
+            Log("Agent key missing, empty, or unreadable in agent-config.json; request skipped (" + endpoint + "). Will retry next interval.", "ERROR");
+        }
+
+        private static bool LogIfUnauthorized(WebException wex, Uri address)
+        {
+            var resp = wex != null ? wex.Response as HttpWebResponse : null;
+            if (resp == null || resp.StatusCode != HttpStatusCode.Unauthorized) return false;
+            Log("HTTP 401 Unauthorized from endpoint " + (address != null ? address.AbsolutePath : "(unknown)") + " (agent key rejected). Will retry next interval.", "ERROR");
+            return true;
+        }
+
+        // Restrict the config file to SYSTEM and Administrators only (no inherited access).
+        private static void ApplyConfigAcl(string path)
+        {
+            try
+            {
+                var sec = new FileSecurity();
+                sec.SetAccessRuleProtection(true, false);
+                sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
+                sec.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), FileSystemRights.FullControl, AccessControlType.Allow));
+                File.SetAccessControl(path, sec);
+            }
+            catch (Exception ex)
+            {
+                Log("Failed to restrict ACL on agent-config.json: " + ex.Message, "ERROR");
             }
         }
 
@@ -275,6 +349,7 @@ namespace InnovationWebWorks.VpsAgent
                 var payload = new Dictionary<string, object>();
                 payload["serverId"] = _serverId;
                 payload["serverToken"] = _serverToken;
+                payload["agentVersion"] = AGENT_VERSION;
                 payload["cpuUsage"] = GetCpuUsage();
                 payload["ram"] = GetRamStats();
                 payload["disks"] = GetDiskStats();
@@ -398,9 +473,17 @@ namespace InnovationWebWorks.VpsAgent
                 Uri.EscapeDataString(_serverId),
                 Uri.EscapeDataString(_serverToken));
 
+            if (string.IsNullOrEmpty(_agentKey))
+            {
+                LogMissingAgentKey("/api/agent/listen-jobs");
+                Thread.Sleep(Math.Max(1, _intervalSeconds) * 1000);
+                return;
+            }
+
             var req = (HttpWebRequest)WebRequest.Create(listenUrl);
             req.Method = "GET";
             req.Timeout = 35000;
+            req.Headers["X-Agent-Key"] = _agentKey;
             req.Headers["X-Server-Token"] = _serverToken;
             req.Headers["X-Server-Id"] = _serverId;
             req.UserAgent = "InnovationVpsServiceAgent/3.0";
@@ -443,8 +526,13 @@ namespace InnovationWebWorks.VpsAgent
             }
             catch (WebException wex)
             {
+                if (LogIfUnauthorized(wex, req.RequestUri))
+                {
+                    // Keep running; retry on the next polling interval
+                    Thread.Sleep(Math.Max(1, _intervalSeconds) * 1000);
+                }
                 // Timeout is normal for long-polling, simply continue
-                if (wex.Status != WebExceptionStatus.Timeout)
+                else if (wex.Status != WebExceptionStatus.Timeout)
                 {
                     Thread.Sleep(2000);
                 }
@@ -465,6 +553,14 @@ namespace InnovationWebWorks.VpsAgent
             Log(string.Format("Executing Remote Job: Action = {0} | User = {1} | Job ID = {2}", action, username, jobId), "JOB");
 
             string resultUrl = _portalBase.TrimEnd('/') + "/api/agent/job-result";
+
+            // Hardening: reject unsafe usernames (e.g. containing ' or ") before any process is started
+            if (!string.IsNullOrEmpty(username) && !IsSafeUsername(username))
+            {
+                Log(string.Format("Rejected job {0}: username failed allowlist validation.", jobId), "WARN");
+                ReportJobResult(resultUrl, jobId, "FAILED", "Invalid username.", "SYSTEM");
+                return;
+            }
 
             // Immediately mark job as PROCESSING so neither this server nor any reboot re-executes it repeatedly
             ReportJobResult(resultUrl, jobId, "PROCESSING", "Job started execution on Windows VPS", username);
@@ -529,7 +625,7 @@ namespace InnovationWebWorks.VpsAgent
                     // Method 2: net.exe user fallback
                     if (!changed)
                     {
-                        int exitCode = RunProcess("net.exe", string.Format("user \"{0}\" \"{1}\"", username, newPass));
+                        int exitCode = RunProcess("net.exe", BuildArgs("user", username, newPass));
                         if (exitCode == 0)
                         {
                             changed = true;
@@ -585,7 +681,7 @@ namespace InnovationWebWorks.VpsAgent
                     {
                         // Method 2: net.exe user /active:yes|no fallback
                         string activeArg = shouldDisable ? "/active:no" : "/active:yes";
-                        RunProcess("net.exe", string.Format("user \"{0}\" {1}", username, activeArg));
+                        RunProcess("net.exe", BuildArgs("user", username, activeArg));
                     }
 
                     string msg = string.Format("Account '{0}' successfully {1} on Windows VPS.", username, shouldDisable ? "DISABLED" : "ENABLED");
@@ -660,6 +756,7 @@ namespace InnovationWebWorks.VpsAgent
 
                     string driveLetter = rawDrive.Replace("Drive", "").Trim().TrimEnd('\\');
                     if (!driveLetter.EndsWith(":")) driveLetter += ":";
+                    if (!IsSafeDriveRoot(driveLetter)) throw new Exception("Invalid drive.");
 
                     string sanitizedFolder = company.Trim().Replace(" ", "_");
                     foreach (char c in Path.GetInvalidFileNameChars()) sanitizedFolder = sanitizedFolder.Replace(c.ToString(), "");
@@ -719,12 +816,12 @@ namespace InnovationWebWorks.VpsAgent
 
                     if (!userCreated)
                     {
-                        RunProcess("net.exe", string.Format("user \"{0}\" \"{1}\" /add /comment:\"Tally Client - {2}\" /expires:never /y", username, pass, company));
-                        RunProcess("net.exe", string.Format("user \"{0}\" \"{1}\" /y", username, pass));
+                        RunProcess("net.exe", BuildArgs("user", username, pass, "/add", "/comment:Tally Client - " + company, "/expires:never", "/y"));
+                        RunProcess("net.exe", BuildArgs("user", username, pass, "/y"));
                     }
 
                     // 3. Add to Remote Desktop Users
-                    RunProcess("net.exe", string.Format("localgroup \"Remote Desktop Users\" \"{0}\" /add", username));
+                    RunProcess("net.exe", BuildArgs("localgroup", "Remote Desktop Users", username, "/add"));
 
                     // 4. Apply Drive-Level & Folder-Level Zero-Trust NTFS Security Isolation
                     ApplyDriveLevelNtfsIsolation(driveLetter, username);
@@ -762,7 +859,7 @@ namespace InnovationWebWorks.VpsAgent
 
                         try
                         {
-                            RunProcess("icacls.exe", string.Format("\"{0}\" /grant \"superclient:(OI)(CI)F\" /q", companyRoot));
+                            RunProcess("icacls.exe", BuildArgs(companyRoot, "/grant", "superclient:(OI)(CI)F", "/q"));
                         }
                         catch { }
                     }
@@ -852,6 +949,32 @@ namespace InnovationWebWorks.VpsAgent
             {
                 ReportJobResult(resultUrl, jobId, "COMPLETED", "Agent auto-update acknowledged.", username);
                 CheckAndApplyAutoUpdate();
+                return;
+            }
+
+            // ACTION 5b: SET_AGENT_KEY (Install per-server Agent_Key; the key is never logged or echoed)
+            if (action == "SET_AGENT_KEY")
+            {
+                string keyErr;
+                try
+                {
+                    string newKey = job.ContainsKey("agentKey") && job["agentKey"] != null ? Convert.ToString(job["agentKey"]).Trim() : "";
+                    keyErr = InstallAgentKey(newKey);
+                }
+                catch (Exception)
+                {
+                    keyErr = "SET_AGENT_KEY failed; old key kept.";
+                }
+                if (keyErr == null)
+                {
+                    Log("Agent key installed via SET_AGENT_KEY.", "SUCCESS");
+                    ReportJobResult(resultUrl, jobId, "COMPLETED", "Agent key installed", "SYSTEM");
+                }
+                else
+                {
+                    Log("SET_AGENT_KEY failed: " + keyErr, "ERROR");
+                    ReportJobResult(resultUrl, jobId, "FAILED", keyErr, "SYSTEM");
+                }
                 return;
             }
 
@@ -1073,7 +1196,11 @@ namespace InnovationWebWorks.VpsAgent
                     // 2. Temporarily disable local user so they cannot reconnect during migration
                     try
                     {
-                        ExecutePowerShell(string.Format("Disable-LocalUser -Name '{0}' -ErrorAction SilentlyContinue; net user '{0}' /active:no", username));
+                        if (!IsSafeUsername(username)) throw new Exception("Invalid username.");
+                        // Username travels base64-encoded inside an -EncodedCommand script, never as raw command text
+                        string b64User = Convert.ToBase64String(Encoding.UTF8.GetBytes(username));
+                        ExecutePowerShellEncoded("$n = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('" + b64User + "')); Disable-LocalUser -Name $n -ErrorAction SilentlyContinue");
+                        RunProcess("net.exe", BuildArgs("user", username, "/active:no"));
                     }
                     catch { }
 
@@ -1656,7 +1783,7 @@ namespace InnovationWebWorks.VpsAgent
                             if (int.TryParse(parts[p], out sid))
                             {
                                 Log(string.Format("Force logging off active session ID {0} for user '{1}'...", sid, username), "INFO");
-                                ExecutePowerShell(string.Format("logoff {0}", sid));
+                                RunProcess("logoff.exe", sid.ToString());
                                 break;
                             }
                         }
@@ -1686,7 +1813,7 @@ namespace InnovationWebWorks.VpsAgent
                             int sid;
                             if (int.TryParse(parts[p], out sid))
                             {
-                                ExecutePowerShell(string.Format("logoff {0}", sid));
+                                RunProcess("logoff.exe", sid.ToString());
                                 sessionsCleaned++;
                                 break;
                             }
@@ -1739,7 +1866,8 @@ namespace InnovationWebWorks.VpsAgent
                     if (d.IsReady && d.DriveType == DriveType.Fixed && d.Name.ToUpper().StartsWith("C") == false)
                     {
                         string ltr = d.Name.Replace(":\\", "").Replace(":", "").Trim();
-                        ExecutePowerShell(string.Format("Optimize-Volume -DriveLetter {0} -ReTrim -ErrorAction SilentlyContinue", ltr));
+                        if (ltr.Length == 1 && char.IsLetter(ltr[0]))
+                            ExecutePowerShellEncoded(string.Format("Optimize-Volume -DriveLetter {0} -ReTrim -ErrorAction SilentlyContinue", ltr));
                     }
                 }
             }
@@ -1983,11 +2111,13 @@ $form.Controls.Add($btnRefresh)
 
             if (!userCreated)
             {
-                RunProcess("net.exe", string.Format("user \"{0}\" \"{1}\" /add /comment:\"Tally Client - {2}\" /expires:never /y", username, pass, company));
-                RunProcess("net.exe", string.Format("user \"{0}\" \"{1}\" /y", username, pass));
+                if (!IsSafeUsername(username)) { Log("CreateOrUpdateWindowsUser: unsafe username rejected.", "WARN"); return; }
+                RunProcess("net.exe", BuildArgs("user", username, pass, "/add", "/comment:Tally Client - " + company, "/expires:never", "/y"));
+                RunProcess("net.exe", BuildArgs("user", username, pass, "/y"));
             }
 
-            RunProcess("net.exe", string.Format("localgroup \"Remote Desktop Users\" \"{0}\" /add", username));
+            if (!IsSafeUsername(username)) return;
+            RunProcess("net.exe", BuildArgs("localgroup", "Remote Desktop Users", username, "/add"));
         }
 
         private static void GrantFolderFullControl(string folderPath, string username)
@@ -2022,7 +2152,7 @@ $form.Controls.Add($btnRefresh)
 
                 try
                 {
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /grant \"superclient:(OI)(CI)F\" /q", folderPath));
+                    RunProcess("icacls.exe", BuildArgs(folderPath, "/grant", "superclient:(OI)(CI)F", "/q"));
                 }
                 catch { }
             }
@@ -2828,8 +2958,7 @@ $form.Controls.Add($btnRefresh)
                         try
                         {
                             string warningText = string.Format("A new login was detected for account '{0}'. This previous session will close in {1} seconds to keep your account secure.", cleanUser, _duplicateGracePeriodSeconds);
-                            string msgCmd = string.Format("msg.exe {0} /time:{1} \"{2}\"", oldId, _duplicateGracePeriodSeconds, warningText);
-                            ExecutePowerShell(msgCmd);
+                            RunProcess("msg.exe", BuildArgs(oldId.ToString(), "/time:" + _duplicateGracePeriodSeconds.ToString(), warningText));
                         }
                         catch { }
 
@@ -2842,7 +2971,8 @@ $form.Controls.Add($btnRefresh)
                         // 3. Forceful Windows session logoff using multiple robust mechanisms
                         try
                         {
-                            ExecutePowerShell(string.Format("& logoff.exe {0} 2>$null; & rwinsta.exe {0} 2>$null", oldId));
+                            RunProcess("logoff.exe", oldId.ToString());
+                            RunProcess("rwinsta.exe", oldId.ToString());
                             WTSLogoffSession(IntPtr.Zero, oldId, false);
                             Log(string.Format("[SUCCESS] Successfully logged off older duplicate Session {0} for user '{1}'.", oldId, cleanUser), "SUCCESS");
                             
@@ -3453,7 +3583,8 @@ $form.Controls.Add($btnRefresh)
                 // Defense-in-depth with native icacls
                 try
                 {
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /grant \"superclient:(F)\" \"{1}:(M)\" /q", iniPath, username));
+                    if (IsSafeUsername(username))
+                        RunProcess("icacls.exe", BuildArgs(iniPath, "/grant", "superclient:(F)", username + ":(M)", "/q"));
                 }
                 catch { }
 
@@ -3464,7 +3595,8 @@ $form.Controls.Add($btnRefresh)
                 // Fallback using icacls
                 try
                 {
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /inheritance:r /grant:r \"Administrators\":(F) \"SYSTEM\":(F) \"superclient\":(F) \"{1}\":(M) /Q", iniPath, username));
+                    if (IsSafeUsername(username))
+                        RunProcess("icacls.exe", BuildArgs(iniPath, "/inheritance:r", "/grant:r", "Administrators:(F)", "SYSTEM:(F)", "superclient:(F)", username + ":(M)", "/Q"));
                 }
                 catch { }
                 Log("Notice setting tally.ini permissions: " + ex.Message, "WARN");
@@ -3499,6 +3631,11 @@ $form.Controls.Add($btnRefresh)
                 }
 
                 string driveRoot = cleanLetter + "\\";
+                if (!IsSafeDriveRoot(driveRoot) || (!string.IsNullOrEmpty(username) && !IsSafeUsername(username)))
+                {
+                    Log("Drive-Level NTFS Isolation rejected: unsafe drive root or username.", "WARN");
+                    return;
+                }
                 if (!Directory.Exists(driveRoot))
                 {
                     Log("Drive root directory does not exist: " + driveRoot, "WARN");
@@ -3600,12 +3737,12 @@ $form.Controls.Add($btnRefresh)
                 // 5. Defense-in-depth: native icacls enforcement to guarantee complete purge of Users/Everyone
                 try
                 {
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /inheritance:r", driveRoot));
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /remove:g \"Users\" \"Everyone\" \"Authenticated Users\" /q", driveRoot));
-                    RunProcess("icacls.exe", string.Format("\"{0}\" /grant:r \"Administrators:(OI)(CI)F\" \"SYSTEM:(OI)(CI)F\" \"superclient:(OI)(CI)F\" /q", driveRoot));
+                    RunProcess("icacls.exe", BuildArgs(driveRoot, "/inheritance:r"));
+                    RunProcess("icacls.exe", BuildArgs(driveRoot, "/remove:g", "Users", "Everyone", "Authenticated Users", "/q"));
+                    RunProcess("icacls.exe", BuildArgs(driveRoot, "/grant:r", "Administrators:(OI)(CI)F", "SYSTEM:(OI)(CI)F", "superclient:(OI)(CI)F", "/q"));
                     if (!string.IsNullOrEmpty(username))
                     {
-                        RunProcess("icacls.exe", string.Format("\"{0}\" /grant \"{1}:(NP)(RX)\" /q", driveRoot, username));
+                        RunProcess("icacls.exe", BuildArgs(driveRoot, "/grant", username + ":(NP)(RX)", "/q"));
                     }
                     Log(string.Format("Native icacls enforcement completed on '{0}'.", driveRoot), "SUCCESS");
                 }
@@ -4141,6 +4278,8 @@ $form.Controls.Add($btnRefresh)
                             _serverToken = Convert.ToString(cfg["serverToken"]);
                         if (cfg.ContainsKey("portalBase") && !string.IsNullOrEmpty(Convert.ToString(cfg["portalBase"])))
                             _portalBase = Convert.ToString(cfg["portalBase"]);
+                        if (cfg.ContainsKey("agentKey") && cfg["agentKey"] != null)
+                            _agentKey = Convert.ToString(cfg["agentKey"]).Trim();
                         if (cfg.ContainsKey("intervalSeconds"))
                             _intervalSeconds = Convert.ToInt32(cfg["intervalSeconds"]);
                     }
@@ -4149,22 +4288,80 @@ $form.Controls.Add($btnRefresh)
             catch { }
         }
 
-        public static void SaveConfig(string serverId, string portalBase, string serverToken = "vps_sec_token_default", int interval = 5)
+        public static void SaveConfig(string serverId, string portalBase, string serverToken = "vps_sec_token_default", int interval = 5, string agentKey = null)
         {
-            try
+            try { SaveConfigCore(serverId, portalBase, serverToken, interval, agentKey); }
+            catch { }
+        }
+
+        // Writes the config to a temp file (SYSTEM + Administrators ACL applied), then replaces
+        // agent-config.json atomically. Throws on failure; the old file and in-memory key are
+        // left untouched until the replace succeeds. Never logs the key.
+        private static void SaveConfigCore(string serverId, string portalBase, string serverToken, int interval, string agentKey)
+        {
             {
                 Directory.CreateDirectory(_appDir);
+
+                // Preserve the existing agentKey unless a new one is supplied
+                string keyToStore = agentKey;
+                if (keyToStore == null)
+                {
+                    keyToStore = _agentKey;
+                    try
+                    {
+                        if (string.IsNullOrEmpty(keyToStore) && File.Exists(_configFile))
+                        {
+                            var existing = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(File.ReadAllText(_configFile));
+                            if (existing != null && existing.ContainsKey("agentKey") && existing["agentKey"] != null)
+                                keyToStore = Convert.ToString(existing["agentKey"]).Trim();
+                        }
+                    }
+                    catch { }
+                }
+                if (keyToStore == null) keyToStore = "";
+
                 var cfg = new Dictionary<string, object>
                 {
                     { "serverId", serverId },
                     { "portalBase", portalBase },
                     { "serverToken", serverToken },
+                    { "agentKey", keyToStore },
                     { "intervalSeconds", interval }
                 };
                 var serializer = new JavaScriptSerializer();
-                File.WriteAllText(_configFile, serializer.Serialize(cfg));
+                string tmpFile = _configFile + ".tmp";
+                try
+                {
+                    File.WriteAllText(tmpFile, serializer.Serialize(cfg));
+                    ApplyConfigAcl(tmpFile);
+                    if (File.Exists(_configFile))
+                        File.Replace(tmpFile, _configFile, null);
+                    else
+                        File.Move(tmpFile, _configFile);
+                }
+                finally
+                {
+                    try { if (File.Exists(tmpFile)) File.Delete(tmpFile); } catch { }
+                }
+                _agentKey = keyToStore;
+                ApplyConfigAcl(_configFile);
             }
-            catch { }
+        }
+
+        // ACTION SET_AGENT_KEY helper: installs a new per-server Agent_Key. Returns null on success, else an error text (never contains the key).
+        private static string InstallAgentKey(string newKey)
+        {
+            if (string.IsNullOrEmpty(newKey) || !System.Text.RegularExpressions.Regex.IsMatch(newKey, @"^ak_[A-Za-z0-9_-]{43}$"))
+                return "Invalid agent key format; key not installed.";
+            try
+            {
+                SaveConfigCore(_serverId, _portalBase, _serverToken, _intervalSeconds, newKey);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                return "Failed to write agent-config.json (" + ex.GetType().Name + "); old key kept.";
+            }
         }
 
         public static void Log(string message, string level = "INFO")
@@ -4257,6 +4454,58 @@ $form.Controls.Add($btnRefresh)
                 string res = RunProcessWithOutput("powershell.exe", "-NoProfile -ExecutionPolicy Bypass -File \"" + tmpPs + "\"");
                 try { File.Delete(tmpPs); } catch { }
                 return res;
+            }
+            catch { return ""; }
+        }
+
+        // ---- Hardening (task 16.7): argument quoting + allowlist validation ----
+
+        // Same allowlist the portal applies to job usernames (no spaces, no quotes, no shell metacharacters).
+        private static bool IsSafeUsername(string u)
+        {
+            return !string.IsNullOrEmpty(u) && System.Text.RegularExpressions.Regex.IsMatch(u, @"^[A-Za-z0-9_.$][A-Za-z0-9_.$-]{0,39}$");
+        }
+
+        // Drive roots such as "C:" or "C:\" only.
+        private static bool IsSafeDriveRoot(string d)
+        {
+            return !string.IsNullOrEmpty(d) && System.Text.RegularExpressions.Regex.IsMatch(d, @"^[A-Za-z]:\\?$");
+        }
+
+        // Quotes one argument per CommandLineToArgvW rules so a quote or trailing backslash cannot break out.
+        private static string QuoteArg(string a)
+        {
+            if (a == null) a = "";
+            if (a.Length > 0 && a.IndexOfAny(new char[] { ' ', '\t', '\n', '\v', '"' }) < 0) return a;
+            var sb = new StringBuilder();
+            sb.Append('"');
+            int bs = 0;
+            foreach (char c in a)
+            {
+                if (c == '\\') { bs++; }
+                else if (c == '"') { sb.Append('\\', bs * 2 + 1); sb.Append('"'); bs = 0; }
+                else { if (bs > 0) { sb.Append('\\', bs); bs = 0; } sb.Append(c); }
+            }
+            if (bs > 0) sb.Append('\\', bs * 2);
+            sb.Append('"');
+            return sb.ToString();
+        }
+
+        // .NET Framework 4 has no ProcessStartInfo.ArgumentList, so build a safely quoted argument string.
+        private static string BuildArgs(params string[] args)
+        {
+            var parts = new string[args.Length];
+            for (int i = 0; i < args.Length; i++) parts[i] = QuoteArg(args[i]);
+            return string.Join(" ", parts);
+        }
+
+        // Runs a PowerShell script via -EncodedCommand (UTF-16LE base64); no file, no command-line quoting.
+        private static string ExecutePowerShellEncoded(string script)
+        {
+            try
+            {
+                string enc = Convert.ToBase64String(Encoding.Unicode.GetBytes(script));
+                return RunProcessWithOutput("powershell.exe", "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + enc);
             }
             catch { return ""; }
         }

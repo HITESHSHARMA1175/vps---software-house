@@ -20,13 +20,16 @@ CREATE TABLE IF NOT EXISTS `vps_servers` (
   `httpUrl` VARCHAR(255) DEFAULT '' COMMENT 'HTTP Web Access URL',
   `httpsUrl` VARCHAR(255) DEFAULT '' COMMENT 'HTTPS Secured Web Access URL',
   `superClientUser` VARCHAR(100) DEFAULT 'Superclient' COMMENT 'SuperClient admin Windows account username',
-  `superClientPass` VARCHAR(100) DEFAULT '' COMMENT 'Encrypted/Managed password for SuperClient account',
+  `superClientPass` VARCHAR(2048) DEFAULT '' COMMENT 'Encrypted/Managed password for SuperClient account',
   `totalUsersLimit` INT DEFAULT 30 COMMENT 'Maximum concurrent client limit allowed on this VPS',
   `specs` VARCHAR(255) DEFAULT '' COMMENT 'Hardware specifications (CPU cores, RAM size, disk capacity)',
   `portSerial` VARCHAR(50) DEFAULT '' COMMENT 'Port Serial / Internal Identifier',
   `status` VARCHAR(50) DEFAULT 'Active' COMMENT 'Operational status: Active, Maintenance, Offline',
   `availableDrives` TEXT COMMENT 'JSON Array of available storage drive letters (e.g. ["C:", "D:", "E:"])',
-  `apiKey` VARCHAR(100) DEFAULT NULL COMMENT 'Agent API authentication key for this server node',
+  `apiKey` VARCHAR(255) DEFAULT NULL COMMENT 'Agent API authentication key for this server node',
+  `previousApiKey` VARCHAR(255) DEFAULT NULL COMMENT 'Hash of the replaced agent key, valid until previousKeyExpiresAt (rotation grace window)',
+  `previousKeyExpiresAt` BIGINT DEFAULT NULL COMMENT 'Epoch milliseconds when the previous agent key stops being accepted',
+  `meta` LONGTEXT DEFAULT NULL COMMENT 'JSON of server runtime attributes (see lib/serverMeta.js)',
   `createdAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Record creation timestamp',
   `updatedAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Last updated timestamp'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -40,7 +43,7 @@ CREATE TABLE IF NOT EXISTS `client_subscriptions` (
   `serverId` VARCHAR(100) NOT NULL COMMENT 'Foreign Key linking to vps_servers(id)',
   `clientType` VARCHAR(50) DEFAULT 'Shared' COMMENT 'Account type: Shared, Dedicated, Multi-User',
   `username` VARCHAR(100) NOT NULL COMMENT 'Windows Local Username on VPS (e.g., shree_ji)',
-  `password` VARCHAR(255) DEFAULT 'Pass#123' COMMENT 'Managed Windows VPS password',
+  `password` VARCHAR(2048) NOT NULL COMMENT 'Managed Windows VPS password',
   `tallySerialNo` VARCHAR(100) DEFAULT '' COMMENT 'Client-specific Tally License Serial Number',
   `company` VARCHAR(255) NOT NULL COMMENT 'Client / Company Name',
   `paymentType` VARCHAR(50) DEFAULT 'Online / Bank' COMMENT 'Billing method (Online, Cash, Cheque, Bank Transfer)',
@@ -54,6 +57,7 @@ CREATE TABLE IF NOT EXISTS `client_subscriptions` (
   `notes` TEXT COMMENT 'Internal administration notes, GSTIN, or billing details',
   `status` VARCHAR(50) DEFAULT 'ACTIVE' COMMENT 'Account status: ACTIVE, Disabled, Suspended, Expired',
   `lastActiveAt` VARCHAR(100) DEFAULT NULL COMMENT 'Last detected active session timestamp',
+  `tallyVersion` VARCHAR(50) DEFAULT '' COMMENT 'Client Tally version (used for migrations)',
   `createdAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Subscription creation date',
   `updatedAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT 'Last modification date',
   INDEX `idx_client_server` (`serverId`),
@@ -74,8 +78,8 @@ CREATE TABLE IF NOT EXISTS `portal_users` (
   `status` VARCHAR(50) DEFAULT 'ACTIVE' COMMENT 'Account status: ACTIVE, SUSPENDED, INACTIVE',
   `email` VARCHAR(255) DEFAULT '' COMMENT 'Staff email address for notifications and 2FA',
   `two_factor_enabled` TINYINT(1) DEFAULT 0 COMMENT '1 if Google Authenticator 2FA is active, 0 if disabled',
-  `two_factor_secret` VARCHAR(128) DEFAULT NULL COMMENT 'Base32 RFC 6238 TOTP shared secret',
-  `two_factor_temp_secret` VARCHAR(128) DEFAULT NULL COMMENT 'Temporary secret during QR code setup confirmation',
+  `two_factor_secret` VARCHAR(512) DEFAULT NULL COMMENT 'Base32 RFC 6238 TOTP shared secret',
+  `two_factor_temp_secret` VARCHAR(512) DEFAULT NULL COMMENT 'Temporary secret during QR code setup confirmation',
   `two_factor_backup_codes` TEXT DEFAULT NULL COMMENT 'JSON array of 8-character emergency backup recovery codes',
   `lastLogin` VARCHAR(100) DEFAULT NULL COMMENT 'Last portal login timestamp',
   `createdAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Account creation date'
@@ -160,6 +164,7 @@ CREATE TABLE IF NOT EXISTS `support_tickets` (
   `resolutionNotes` TEXT COMMENT 'Technical resolution notes upon ticket closure',
   `voiceNoteUrl` TEXT COMMENT 'URL path to recorded voice note audio (WebM)',
   `createdBy` VARCHAR(100) DEFAULT 'Staff' COMMENT 'Creator of ticket (Staff, Customer, System)',
+  `source` VARCHAR(30) DEFAULT '' COMMENT 'Origin: CUSTOMER_PORTAL, STAFF',
   `resolvedAt` VARCHAR(50) DEFAULT NULL COMMENT 'Resolution timestamp',
   `createdAt` TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT 'Ticket creation timestamp',
   INDEX `idx_tkt_client` (`clientId`),
@@ -252,7 +257,7 @@ CREATE TABLE IF NOT EXISTS `vps_provision_jobs` (
   `action` VARCHAR(50) DEFAULT 'PROVISION_TALLY_USER' COMMENT 'Action command: PROVISION_TALLY_USER, CHANGE_USER_PASSWORD, TOGGLE_USER_STATUS, TERMINATE_SESSION',
   `companyName` VARCHAR(255) NOT NULL COMMENT 'Client company name',
   `username` VARCHAR(100) NOT NULL COMMENT 'Windows local account username',
-  `password` VARCHAR(255) NOT NULL COMMENT 'User password or new password for change jobs',
+  `password` VARCHAR(2048) NOT NULL COMMENT 'User password or new password for change jobs',
   `drive` VARCHAR(50) NOT NULL COMMENT 'Target storage drive letter',
   `expiryDate` VARCHAR(50) DEFAULT NULL COMMENT 'Subscription expiry date',
   `setupTSplus` TINYINT DEFAULT 1 COMMENT 'Flag to configure TSplus application publishing',
@@ -287,7 +292,49 @@ CREATE TABLE IF NOT EXISTS `server_telemetry_history` (
   INDEX `idx_hist_srv_time` (`serverId`, `createdAt`),
   INDEX `idx_hist_created` (`createdAt`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
+-- ------------------------------------------------------------------------------
+-- Table 14-17: Entity_Tables (`requests`, `renewals`, `migrations`, `deleted_servers`)
+-- Purpose: Durable storage for requests, renewals, migrations (JSON document in `data`)
+-- and deleted-server tombstones. Safe to run repeatedly; never drops or alters data.
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `requests` (
+  `id` VARCHAR(100) PRIMARY KEY,
+  `status` VARCHAR(50),
+  `createdAt` VARCHAR(50),
+  `data` LONGTEXT NOT NULL,
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS `renewals` (
+  `id` VARCHAR(100) PRIMARY KEY,
+  `status` VARCHAR(50),
+  `createdAt` VARCHAR(50),
+  `data` LONGTEXT NOT NULL,
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS `migrations` (
+  `id` VARCHAR(100) PRIMARY KEY,
+  `status` VARCHAR(50),
+  `createdAt` VARCHAR(50),
+  `data` LONGTEXT NOT NULL,
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+CREATE TABLE IF NOT EXISTS `deleted_servers` (
+  `token` VARCHAR(255) PRIMARY KEY,
+  `serverId` VARCHAR(100),
+  `deletedAt` VARCHAR(50),
+  `snapshot` LONGTEXT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+-- ------------------------------------------------------------------------------
+-- Table 18: workspace_requests
+-- Purpose: Public "request demo" workspace deployment leads (JSON document in `data`).
+-- ------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS `workspace_requests` (
+  `id` VARCHAR(100) PRIMARY KEY,
+  `createdAt` VARCHAR(50),
+  `status` VARCHAR(50),
+  `data` LONGTEXT NOT NULL,
+  KEY `idx_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 -- ==============================================================================
 -- End of Schema Definition
 -- ==============================================================================

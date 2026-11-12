@@ -1,0 +1,15 @@
+{
+  "rows": [
+    ["VPS IP Address", "Username", "Valid Till", "Drive"],
+    ["10.0.0.1", "alice", 45000, "D"],
+    ["10.0.0.2", "bob", "", ""],
+    ["10.0.0.3", "carol", "15/03/2023", "E"]
+  ],
+  "csvRows": [
+    ["VPS IP Address", "Username", "Valid Till", "Drive"],
+    ["10.0.0.1", "alice", "45000", "D"],
+    ["10.0.0.2", "bob", "", ""],
+    ["10.0.0.3", "carol", "15/03/2023", "E"]
+  ],
+  "dateCode": { "y": 2023, "m": 3, "d": 15 }
+}

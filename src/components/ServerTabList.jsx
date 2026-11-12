@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useAuth } from '../contexts/AuthContext';
 import { Server, ShieldCheck, Cpu, HardDrive, Edit2, Trash2, CheckCircle2, AlertCircle, ChevronDown, ChevronUp, Shield, Zap, ExternalLink, Database } from 'lucide-react';
 
 export default function ServerTabList({
@@ -11,6 +12,8 @@ export default function ServerTabList({
   onDirectRemoteConnect
 }) {
   const [showDriveInspector, setShowDriveInspector] = useState(false);
+  const { currentUser } = useAuth();
+  const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
 
   const getUserCountForServer = (serverId) => {
     return users.filter(u => u.serverId === serverId).length;
@@ -50,7 +53,8 @@ export default function ServerTabList({
       serverId: server.id,
       company: server.name,
       username: server.superClientUser || 'Superclient',
-      password: server.superClientPass || 'Pass#123',
+      password: '', // never sent to the browser; SUPER_ADMIN reveals it on demand via the backend
+      isServerAccount: true,
       drive: 'Master Node',
       expiryDate: '2099-12-31'
     };
@@ -97,6 +101,8 @@ export default function ServerTabList({
                 gap: '6px'
               }}
               onClick={(e) => handleServerSuperLogin(e, selectedServer)}
+              disabled={!isSuperAdmin}
+              title={isSuperAdmin ? undefined : 'Super Admin only'}
             >
               <Shield size={14} fill="#ffffff" /> Superclient Admin Login
             </button>
@@ -198,7 +204,8 @@ export default function ServerTabList({
                 <div style={{ display: 'flex', gap: '4px' }} onClick={e => e.stopPropagation()}>
                   <button
                     className="action-btn"
-                    title="👑 Direct Superclient Admin Login"
+                    disabled={!isSuperAdmin}
+                    title={isSuperAdmin ? '👑 Direct Superclient Admin Login' : 'Super Admin only'}
                     style={{
                       color: '#ffffff',
                       background: 'linear-gradient(135deg, #d97706, #b45309)',

@@ -1,4 +1,6 @@
-import React from 'react';
+import React, { useState } from 'react';
+import { useAuth, API_BASE } from '../contexts/AuthContext';
+import { revealClientPassword, copyRevealedPassword, MASKED_PASSWORD_TEXT } from '../utils/revealPassword';
 import {
   X,
   User,
@@ -24,6 +26,9 @@ export default function UserProfileModal({
   onClose,
   onDirectRemoteConnect
 }) {
+  const { currentUser, authFetch } = useAuth();
+  const [copied, setCopied] = useState(false);
+
   if (!user) return null;
 
   const server = servers.find(s => s.id === user.serverId);
@@ -31,8 +36,18 @@ export default function UserProfileModal({
   const isExpired = daysRemaining < 0;
   const isDedicated = user.clientType === 'Dedicated';
 
-  const userPassword = user.password || 'Pass#123';
-  const superPass = server ? (server.superClientPass || 'Pass#123') : 'Pass#123';
+  const isSuperAdmin = !!currentUser && currentUser.role === 'SUPER_ADMIN';
+
+  // SUPER_ADMIN only: fetch on click, copy, and discard (never kept in state)
+  const handleRevealCopy = async () => {
+    try {
+      await copyRevealedPassword(() => revealClientPassword(authFetch, API_BASE, user.id));
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
+  };
 
   const waMessage = encodeURIComponent(
     `Hello ${user.company},\n\nYour VPS Cloud Subscription (${server ? server.name : 'VPS'}) expires on ${user.expiryDate} (${daysRemaining} days remaining).\n\nThank you,\nInnovation Web Works Operations`
@@ -112,7 +127,19 @@ export default function UserProfileModal({
 
             <div>
               <div style={{ fontSize: '0.72rem', color: '#64748b', fontWeight: '700', textTransform: 'uppercase' }}>User Password</div>
-              <div style={{ fontSize: '0.85rem', color: '#34d399', fontFamily: 'monospace', fontWeight: '700', marginTop: '2px' }}>{userPassword}</div>
+              <div style={{ fontSize: '0.85rem', color: '#34d399', fontFamily: 'monospace', fontWeight: '700', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                {MASKED_PASSWORD_TEXT}
+                {isSuperAdmin && (
+                  <button
+                    type="button"
+                    onClick={handleRevealCopy}
+                    title="Reveal and copy password (audited)"
+                    style={{ background: 'none', border: '1px solid rgba(52, 211, 153, 0.4)', color: '#34d399', borderRadius: '4px', fontSize: '0.7rem', padding: '1px 6px', cursor: 'pointer' }}
+                  >
+                    {copied ? 'Copied' : 'Reveal & Copy'}
+                  </button>
+                )}
+              </div>
             </div>
 
             <div>

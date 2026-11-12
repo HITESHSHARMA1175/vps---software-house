@@ -1,7 +1,9 @@
 import React, { useState } from 'react';
 import { Search, Filter, Calendar, Edit2, Trash2, RefreshCw, AlertTriangle, AlertCircle, CheckCircle, Mail, Send, Download, FileText, FileSpreadsheet, Upload, Lock, Unlock, Zap, Copy, Check, Key, Shield, Users } from 'lucide-react';
 import ActionsDropdown from './ui/ActionsDropdown';
-import { exportExpiringUsersCSV, exportServerUserExcel } from '../utils/exportUtils';
+import { useAuth, API_BASE } from '../contexts/AuthContext';
+import { revealClientPassword, revealServerPassword, copyRevealedPassword, MASKED_PASSWORD_TEXT } from '../utils/revealPassword';
+import { exportExpiringUsersCSV, exportServerUserExcel, exportServerUserWithPasswords } from '../utils/exportUtils';
 
 export function getDaysRemaining(expiryDateStr) {
   if (!expiryDateStr) return 999;
@@ -63,16 +65,39 @@ export default function UserTable({
   const [copiedKey, setCopiedKey] = useState(null);
 
   const canExport = currentUser && currentUser.permissions && currentUser.permissions.canExport;
+  const isSuperAdmin = !!currentUser && currentUser.role === 'SUPER_ADMIN';
+  const [isExportingPw, setIsExportingPw] = useState(false);
+
+  const handleExportWithPasswords = async () => {
+    const scope = selectedServerId && selectedServerId !== 'ALL' ? 'the selected server' : 'ALL servers';
+    const ok = window.confirm(
+      `Export client passwords for ${scope}?\n\nThe file will contain plaintext passwords. This action is recorded in the audit log. Store the file securely and delete it after use.`
+    );
+    if (!ok) return; // cancelled: nothing is sent
+    setIsExportingPw(true);
+    try {
+      await exportServerUserWithPasswords(selectedServerId);
+    } catch (err) {
+      window.alert(`Export with passwords failed: ${err.message}`);
+    } finally {
+      setIsExportingPw(false);
+    }
+  };
   const canEditClient = !currentUser || !currentUser.permissions || currentUser.permissions.canEditClient !== false;
   const canDeleteClient = !currentUser || !currentUser.permissions || currentUser.permissions.canDeleteClient !== false;
   const canRenewClient = !currentUser || !currentUser.permissions || currentUser.permissions.canRenewClient !== false;
 
-  const copyTextToClipboard = (text, key) => {
+  const { authFetch } = useAuth();
+
+  // SUPER_ADMIN only: fetch the password on click, copy it, and discard it (never kept in state)
+  const revealAndCopy = async (fetcher, key) => {
     try {
-      navigator.clipboard.writeText(text);
+      await copyRevealedPassword(fetcher);
       setCopiedKey(key);
       setTimeout(() => setCopiedKey(null), 2000);
-    } catch (e) {}
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
   };
 
   // Filter users based on search, filters, and Salesperson isolation
@@ -238,6 +263,18 @@ export default function UserTable({
               >
                 <FileSpreadsheet size={15} /> Export Server Excel
               </button>
+
+              {isSuperAdmin && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ background: 'rgba(239, 68, 68, 0.15)', color: '#f87171', border: '1px solid rgba(239, 68, 68, 0.4)' }}
+                  onClick={handleExportWithPasswords}
+                  disabled={isExportingPw}
+                  title="Super Admin only: export clients including passwords (audited)"
+                >
+                  <Key size={15} /> {isExportingPw ? 'Exporting...' : 'Export with passwords'}
+                </button>
+              )}
             </>
           ) : (
             <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: '4px', background: 'rgba(9, 14, 26, 0.8)', padding: '0.4rem 0.75rem', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-color)' }}>
@@ -408,9 +445,6 @@ export default function UserTable({
                 const isDedicated = user.clientType === 'Dedicated';
                 const isChecked = selectedUserIds.includes(user.id);
 
-                const userPassword = user.password || 'Pass#123';
-                const superPass = server ? (server.superClientPass || 'Pass#123') : 'Pass#123';
-
                 const waMessage = encodeURIComponent(
                   `Hello ${user.company},\n\nYour VPS Cloud Subscription (${server ? server.name : 'VPS'}) expires on ${user.expiryDate} (${daysRemaining} days remaining).\n\nThank you,\nInnovation Web Works Operations`
                 );
@@ -431,10 +465,15 @@ export default function UserTable({
                       </div>
 
                       {/* Password Quick Copy Badges */}
+                      {!isSuperAdmin ? (
+                        <div style={{ fontSize: '11px', color: '#64748b', fontFamily: 'monospace' }} title="Passwords are visible to Super Admin only">
+                          Password: {MASKED_PASSWORD_TEXT}
+                        </div>
+                      ) : (
                       <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
                         <button
                           type="button"
-                          title="Click to copy dedicated user password"
+                          title="Reveal and copy user password (audited)"
                           style={{
                             background: copiedKey === `user-${user.id}` ? 'rgba(16, 185, 129, 0.3)' : 'rgba(52, 211, 153, 0.15)',
                             border: '1px solid rgba(52, 211, 153, 0.4)',
@@ -448,15 +487,16 @@ export default function UserTable({
                             alignItems: 'center',
                             gap: '3px'
                           }}
-                          onClick={() => copyTextToClipboard(userPassword, `user-${user.id}`)}
+                          onClick={() => revealAndCopy(() => revealClientPassword(authFetch, API_BASE, user.id), `user-${user.id}`)}
                         >
                           {copiedKey === `user-${user.id}` ? <Check size={11} /> : <Key size={11} />}
-                          User Pass
+                          Reveal User Pass
                         </button>
 
+                        {server && (
                         <button
                           type="button"
-                          title="Click to copy super admin password"
+                          title="Reveal and copy super admin password (audited)"
                           style={{
                             background: copiedKey === `super-${user.id}` ? 'rgba(245, 158, 11, 0.3)' : 'rgba(245, 158, 11, 0.15)',
                             border: '1px solid rgba(245, 158, 11, 0.4)',
@@ -470,12 +510,14 @@ export default function UserTable({
                             alignItems: 'center',
                             gap: '3px'
                           }}
-                          onClick={() => copyTextToClipboard(superPass, `super-${user.id}`)}
+                          onClick={() => revealAndCopy(() => revealServerPassword(authFetch, API_BASE, server.id), `super-${user.id}`)}
                         >
                           {copiedKey === `super-${user.id}` ? <Check size={11} /> : <Shield size={11} />}
-                          Super Pass
+                          Reveal Super Pass
                         </button>
+                        )}
                       </div>
+                      )}
                     </td>
                     <td>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>

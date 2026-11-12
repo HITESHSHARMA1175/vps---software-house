@@ -115,7 +115,8 @@ export default function TopNavbar({
       serverId: server.id,
       company: server.name,
       username: server.superClientUser || 'Superclient',
-      password: server.superClientPass || 'Pass#123',
+      password: '', // never sent to the browser; SUPER_ADMIN reveals it on demand via the backend
+      isServerAccount: true,
       drive: 'Master Node',
       expiryDate: '2099-12-31'
     };
@@ -289,8 +290,9 @@ export default function TopNavbar({
 
                           <button
                             onClick={() => handleServerSuperLogin(server)}
+                            disabled={!isSuperAdmin}
                             className="btn btn-warning btn-xs"
-                            title={`Direct Superclient Admin Login for ${server.ipPort}`}
+                            title={isSuperAdmin ? `Direct Superclient Admin Login for ${server.ipPort}` : 'Super Admin only'}
                           >
                             <Shield size={11} /> Superclient
                           </button>

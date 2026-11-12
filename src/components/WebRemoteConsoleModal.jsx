@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useAuth, API_BASE } from '../contexts/AuthContext';
+import { revealClientPassword, revealServerPassword, MASKED_PASSWORD_TEXT } from '../utils/revealPassword';
 import { X, Monitor, ExternalLink, Copy, Check, ShieldCheck, Key, User, Globe, ArrowRight, Sparkles, RefreshCw, Zap, Lock, Shield, AlertTriangle, Play } from 'lucide-react';
 
 export function buildVpsLoginUrl(server, targetUsername, targetPassword, useHttp = false) {
@@ -32,6 +34,7 @@ export function buildVpsLoginUrl(server, targetUsername, targetPassword, useHttp
 }
 
 export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, loginMode = 'USER' }) {
+  const { currentUser, authFetch } = useAuth();
   const [copiedField, setCopiedField] = useState(null);
   const [useHttpFallback, setUseHttpFallback] = useState(false);
   const iframeRef = useRef(null);
@@ -42,14 +45,18 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
     ? (server ? server.superClientUser || 'Superclient' : 'Superclient')
     : user.username;
 
-  const targetPassword = isSuperclientMode
-    ? (server ? server.superClientPass || 'Pass#123' : 'Pass#123')
-    : (user.password || 'Pass#123');
+  const isSuperAdmin = !!currentUser && currentUser.role === 'SUPER_ADMIN';
 
-  const directAutoLoginUrl = buildVpsLoginUrl(server, targetUsername, targetPassword, useHttpFallback);
+  // The password is never held in state or props: it is fetched on click (SUPER_ADMIN only),
+  // used for that one action, and dropped.
+  const fetchTargetPassword = () => (isSuperclientMode
+    ? revealServerPassword(authFetch, API_BASE, server && server.id)
+    : revealClientPassword(authFetch, API_BASE, user && user.id));
 
-  // JavaScript Bookmarklet snippet for 1-Click Auto-Fill on TSplus
-  const bookmarkletCode = `javascript:(function(){var u='${targetUsername}',p='${targetPassword}';var uEl=document.getElementById('editbox_username')||document.querySelector('input[type="text"]')||document.querySelector('input[name="login"]');var pEl=document.getElementById('editbox_password')||document.querySelector('input[type="password"]')||document.querySelector('input[name="password"]');if(uEl){uEl.value=u;uEl.dispatchEvent(new Event('input'));}if(pEl){pEl.value=p;pEl.dispatchEvent(new Event('input'));}var b=document.querySelector('input[type="submit"]')||document.querySelector('button')||document.getElementById('logonbutton');if(b)b.click();})();`;
+  // URL shown/loaded by default carries no password
+  const directAutoLoginUrl = buildVpsLoginUrl(server, targetUsername, '', useHttpFallback);
+
+  const buildBookmarklet = (pw) => `javascript:(function(){var u=${JSON.stringify(targetUsername)},p=${JSON.stringify(pw)};var uEl=document.getElementById('editbox_username')||document.querySelector('input[type="text"]')||document.querySelector('input[name="login"]');var pEl=document.getElementById('editbox_password')||document.querySelector('input[type="password"]')||document.querySelector('input[name="password"]');if(uEl){uEl.value=u;uEl.dispatchEvent(new Event('input'));}if(pEl){pEl.value=p;pEl.dispatchEvent(new Event('input'));}var b=document.querySelector('input[type="submit"]')||document.querySelector('button')||document.getElementById('logonbutton');if(b)b.click();})();`;
 
   useEffect(() => {
     if (isOpen) {
@@ -77,9 +84,43 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
     } catch (e) {}
   };
 
-  const handleOpenExternalAutoLogin = (forceHttp = false) => {
-    const targetUrl = buildVpsLoginUrl(server, targetUsername, targetPassword, forceHttp);
-    window.open(targetUrl, '_blank', 'noopener,noreferrer');
+  const handleOpenExternalAutoLogin = async (forceHttp = false) => {
+    if (!isSuperAdmin) {
+      window.open(buildVpsLoginUrl(server, targetUsername, '', forceHttp), '_blank', 'noopener,noreferrer');
+      return;
+    }
+    // Open the tab synchronously (avoids popup blockers), then navigate it once the password is fetched
+    const tab = window.open('about:blank', '_blank');
+    try {
+      const pw = await fetchTargetPassword();
+      if (tab) {
+        tab.opener = null;
+        tab.location.href = buildVpsLoginUrl(server, targetUsername, pw, forceHttp);
+      }
+    } catch (err) {
+      if (tab) tab.close();
+      window.alert(`Reveal failed: ${err.message}`);
+    }
+  };
+
+  const handleCopyPassword = async () => {
+    try {
+      const pw = await fetchTargetPassword();
+      await navigator.clipboard.writeText(pw);
+      setCopiedField('pass');
+      setTimeout(() => setCopiedField(null), 2000);
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
+  };
+
+  const handleAutoLoginFrame = async () => {
+    try {
+      const pw = await fetchTargetPassword();
+      if (iframeRef.current) iframeRef.current.src = buildVpsLoginUrl(server, targetUsername, pw, useHttpFallback);
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
   };
 
   const handleCopyBypassCode = () => {
@@ -88,10 +129,15 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
     setTimeout(() => setCopiedField(null), 2500);
   };
 
-  const handleCopyBookmarklet = () => {
-    navigator.clipboard.writeText(bookmarkletCode);
-    setCopiedField('bookmarklet');
-    setTimeout(() => setCopiedField(null), 2500);
+  const handleCopyBookmarklet = async () => {
+    try {
+      const pw = await fetchTargetPassword();
+      await navigator.clipboard.writeText(buildBookmarklet(pw));
+      setCopiedField('bookmarklet');
+      setTimeout(() => setCopiedField(null), 2500);
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
   };
 
   return (
@@ -192,11 +238,13 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
                 backgroundColor: copiedField === 'pass' ? 'rgba(16, 185, 129, 0.2)' : undefined,
                 borderColor: copiedField === 'pass' ? '#10b981' : undefined
               }}
-              onClick={() => copyToClipboard(targetPassword, 'pass')}
+              disabled={!isSuperAdmin}
+              title={isSuperAdmin ? 'Reveal and copy password (audited)' : 'Passwords are visible to Super Admin only'}
+              onClick={handleCopyPassword}
             >
               <div style={{ textAlign: 'left' }}>
                 <div style={{ fontSize: '0.7rem', color: '#94a3b8', textTransform: 'uppercase', fontWeight: '700' }}>2️⃣ Step 2: Password</div>
-                <div style={{ fontSize: '0.9rem', fontWeight: '800', color: '#f59e0b' }}>{targetPassword}</div>
+                <div style={{ fontSize: '0.9rem', fontWeight: '800', color: '#f59e0b' }}>{MASKED_PASSWORD_TEXT}</div>
               </div>
               {copiedField === 'pass' ? <Check size={16} color="#34d399" /> : <Key size={16} color="#f59e0b" />}
             </button>
@@ -211,8 +259,9 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
                 background: 'linear-gradient(135deg, #6366f1, #4f46e5)',
                 border: 'none'
               }}
+              disabled={!isSuperAdmin}
               onClick={handleCopyBookmarklet}
-              title="Copy 1-Click JavaScript Auto-Fill script to paste in browser console / address bar!"
+              title={isSuperAdmin ? 'Reveal password and copy 1-Click JavaScript Auto-Fill script (audited)' : 'Auto-fill script is available to Super Admin only'}
             >
               <div style={{ textAlign: 'left' }}>
                 <div style={{ fontSize: '0.7rem', color: '#c7d2fe', textTransform: 'uppercase', fontWeight: '700' }}>3️⃣ Step 3: Auto-Fill Injector</div>
@@ -257,6 +306,17 @@ export default function WebRemoteConsoleModal({ isOpen, onClose, user, server, l
               >
                 Switch to {useHttpFallback ? 'HTTPS:443' : 'HTTP:8080'}
               </button>
+
+              {isSuperAdmin && (
+                <button
+                  className="btn btn-secondary"
+                  style={{ padding: '0.25rem 0.5rem', fontSize: '0.72rem' }}
+                  onClick={handleAutoLoginFrame}
+                  title="Reveal password and sign in inside the frame (audited)"
+                >
+                  <Key size={12} /> Auto-login
+                </button>
+              )}
 
               <button
                 className="btn btn-secondary"

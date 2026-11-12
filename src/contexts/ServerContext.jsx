@@ -133,7 +133,9 @@ export function ServerProvider({ children }) {
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || 'Server rejected creation');
       }
+      const created = await res.json().catch(() => ({}));
       await fetchServers();
+      return created; // may carry the one-time agentKey / agentInstall
     } catch (e) {
       showToast(`Failed to persist server: ${e.message}`, 'error');
       await fetchServers();
