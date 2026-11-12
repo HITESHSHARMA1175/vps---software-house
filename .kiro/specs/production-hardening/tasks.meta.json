@@ -3946,6 +3946,111 @@
         "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
         "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
         "timestamp": 1794472479561
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794472976443
+      }
+    ],
+    "45. Async route error handling for job-queue routes": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794472976595
+      }
+    ],
+    "46.1 Return 503 from routes that swallow `DbUnavailableError`": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473026294
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473651404
+      }
+    ],
+    "46.2 Flip the pinned startup tests": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473651571
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473809862
+      }
+    ],
+    "46. HTTP 503 when the database is unavailable": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473809979
+      }
+    ],
+    "47.1 Remove `apiKey` from `GET /api/servers`": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473837129
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473962886
+      }
+    ],
+    "47.2 Flip the `apiKey` test": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794473963849
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474297727
+      }
+    ],
+    "47. Strip the Agent_Key hash from server responses": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474297836
+      }
+    ],
+    "49.1 Delete the `serverToken` value from the embedded installer": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474315771
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474435296
+      }
+    ],
+    "49.2 Flip the smoke test": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474436113
+      },
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474630586
+      }
+    ],
+    "49. Remove `serverToken` from the install template": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794474630688
       }
     ]
   }

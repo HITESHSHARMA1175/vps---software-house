@@ -994,38 +994,38 @@ These tasks close the known issues the Phase 5 tests pinned down with `it.fails`
     - _Requirements: 10.11, 18.1, 24.4, 29.5, 35.3_
     - Change_Report: `tests/helpers/*` (modified, at most 2 files), `tests/dbFilePath.test.js` (added). Verify: `npx vitest run tests/dbFilePath.test.js` passes; `git status` shows `database.json` unmodified after `npm test`.
 
-- [ ] 45. Async route error handling for job-queue routes
+- [x] 45. Async route error handling for job-queue routes
   - [x] 45.1 Wrap the async job-queue routes
     - Add a small `asyncHandler(fn)` wrapper in `server.js` (or `lib/asyncHandler.js` if that keeps `server.js` edits smaller) that forwards rejections to the error path
     - Apply it to `POST /api/users`, `POST /api/users/:id/provision-vps`, and the `os-users/:username/change-password` route; a `JobParamError` returns HTTP 400 `{ error: 'Invalid request' }` (generic, no field names or values), and any other error keeps its current behavior
     - _Requirements: 24.4, 24.5, 27.4, 27.5_
     - Change_Report: `server.js` (modified), `lib/asyncHandler.js` (added only if used). Verify: a request with an invalid job parameter returns 400 with the generic body and the process logs no `unhandledRejection`.
 
-  - [-] 45.2 Un-skip the provisioning tests
+  - [x] 45.2 Un-skip the provisioning tests
     - Change the 3 `it.skip` tests in `tests/provision.test.js` to `it`; adjust only their assertions to the generic 400 body
     - _Requirements: 18.1, 24.4, 27.4, 27.5, 35.4_
     - Change_Report: `tests/provision.test.js` (modified). Verify: `npx vitest run tests/provision.test.js` passes with 0 skipped.
 
-- [ ] 46. HTTP 503 when the database is unavailable
-  - [ ] 46.1 Return 503 from routes that swallow `DbUnavailableError`
+- [x] 46. HTTP 503 when the database is unavailable
+  - [x] 46.1 Return 503 from routes that swallow `DbUnavailableError`
     - In production (`config.isProduction`, no `ALLOW_JSON_FALLBACK=1`), make `GET /api/requests`, `GET /api/renewals`, `GET /api/servers`, `GET /api/employees`, the `/api/auth/login` fallback path, and `POST /api/public/tickets` respond `503 { error: 'Database unavailable' }` when `DbUnavailableError` is thrown, instead of returning an empty list or a fallback result
     - Log the underlying error server-side only; outside production keep current behavior
     - _Requirements: 11.1, 24.4, 24.5, 34.1, 34.2_
     - Change_Report: `server.js` (modified). Verify: with the DB layer forced to throw `DbUnavailableError` in production mode, each listed route returns 503 with exactly that body and no error detail.
 
-  - [ ] 46.2 Flip the pinned startup tests
+  - [x] 46.2 Flip the pinned startup tests
     - Change the two `it.fails` tests in `tests/startup.test.js` to normal `it`; extend them to cover the six routes above if they cover fewer
     - _Requirements: 11.1, 18.1, 34.1, 35.4_
     - Change_Report: `tests/startup.test.js` (modified). Verify: `npx vitest run tests/startup.test.js` passes with no `it.fails` left.
 
-- [ ] 47. Strip the Agent_Key hash from server responses
-  - [ ] 47.1 Remove `apiKey` from `GET /api/servers`
+- [x] 47. Strip the Agent_Key hash from server responses
+  - [x] 47.1 Remove `apiKey` from `GET /api/servers`
     - Add `apiKey` to the fields stripped by the server projection in `lib/publicProjections.js` and make sure `GET /api/servers` in `server.js` uses it for every server in the response (including the fallback path)
     - Check the frontend does not read `apiKey` (`grep -rn "apiKey" src/`); if it does, update that file in this task
     - _Requirements: 1.7, 24.4, 24.5, 34.3_
     - Change_Report: `lib/publicProjections.js` (modified), `server.js` (modified). Verify: `GET /api/servers` JSON contains no `apiKey` key at any depth; other fields are unchanged.
 
-  - [ ] 47.2 Flip the `apiKey` test
+  - [x] 47.2 Flip the `apiKey` test
     - Change the existing `it.fails` test to a normal test asserting the response omits `apiKey`; add a unit case for the projection
     - _Requirements: 1.7, 18.1, 34.3, 35.4_
     - Change_Report: the test file that holds the `it.fails` test (modified), `tests/publicProjections.test.js` (modified or added). Verify: both pass and no `it.fails` remains for this issue.
@@ -1046,14 +1046,14 @@ These tasks close the known issues the Phase 5 tests pinned down with `it.fails`
     - _Requirements: 8.5, 18.1, 23.1, 35.4_
     - Change_Report: `RUNBOOK.md` (modified). Verify: `npx vitest run tests/migrate.twice.test.js` passes; RUNBOOK 9.3 is marked fixed.
 
-- [ ] 49. Remove `serverToken` from the install template
-  - [ ] 49.1 Delete the `serverToken` value from the embedded installer
+- [x] 49. Remove `serverToken` from the install template
+  - [x] 49.1 Delete the `serverToken` value from the embedded installer
     - In `server.js` around line 7408 (use `grep -n "serverToken" server.js`), remove the `serverToken` value from the embedded install template so generated installers no longer write it into `agent-config.json`
     - Older installed agents keep working: the backend ignores `serverToken` (task 8.1) and the agent falls back to its built-in default. ASK FIRST is not needed.
     - _Requirements: 5.3, 24.4, 24.5, 26.2_
     - Change_Report: `server.js` (modified). Verify: `grep -n "serverToken" server.js` shows no installer-template value; a generated installer still contains `agentKey`.
 
-  - [ ] 49.2 Flip the smoke test
+  - [x] 49.2 Flip the smoke test
     - Change the `it.fails` test in `tests/staticRequirements.smoke.test.js` to a normal `it` asserting `server.js` has no `serverToken` value in the install template
     - _Requirements: 5.2, 18.1, 26.2, 35.4_
     - Change_Report: `tests/staticRequirements.smoke.test.js` (modified). Verify: `npx vitest run tests/staticRequirements.smoke.test.js` passes.

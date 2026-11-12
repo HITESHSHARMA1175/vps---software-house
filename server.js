@@ -234,6 +234,26 @@ app.get('/health', createHealthHandler({ getDb: () => (isMysqlConnected && dbPoo
 app.use(express.json({ limit: '25mb' }));
 app.use(cookieParser());
 
+// Task 46.1 (Req 11.2): in strict production mode every /api route that needs MySQL answers 503 while the pool is
+// known to be down, so no route serves or accepts in-memory fallback data. /api/agent/* is exempt: those routes keep
+// their own handling (job routes forward DbUnavailableError to the final handler) and the agents retry on their own.
+// When the pool was last seen failing, one SELECT 1 probes it; a success clears the flag and the request proceeds.
+app.use('/api', async (req, res, next) => {
+  if (!strictMysql || req.path.startsWith('/agent/')) return next();
+  if (!isMysqlConnected || !dbPool) return replyDbUnavailable(new DbUnavailableError({ code: 'NOT_CONNECTED' }), req, res);
+  // Reads probe only after a failure was seen; every mutating request probes first, so the first
+  // request after MySQL drops cannot be accepted (task 46.1, first-failure window).
+  const isRead = req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+  if (!dbRuntimeDown && isRead) return next();
+  try {
+    await dbPool.query('SELECT 1');
+    return next();
+  } catch (e) {
+    if (replyDbUnavailable(e, req, res)) return;
+    return next(e);
+  }
+});
+
 // Maps a JobParamError raised inside queueServerJob to HTTP 400 for whichever route triggered it.
 // The route's own catch may still answer 500 with err.message; this wrapper downgrades that to the
 // generic 400 (statusCode 400 on JobParamError) so nothing about the rejected input is echoed.
@@ -400,6 +420,20 @@ const DB_CONNECTION_ERROR_CODES = new Set([
 function isDbConnectionError(err) {
   return !!err && (err.fatal === true || DB_CONNECTION_ERROR_CODES.has(err.code));
 }
+// Task 46.1: last-known pool health in strict mode (set by the wrapped pool, cleared by any successful call).
+let dbRuntimeDown = false;
+// True when err is the DbUnavailableError raised by the wrapped pool (strict production mode only).
+function isDbUnavailable(err) {
+  return strictMysql && err instanceof DbUnavailableError;
+}
+// Strict mode: answers 503 { error: 'Database unavailable' } for a DbUnavailableError and returns true.
+// Logs only the method, path and error code (never SQL, params or messages that could carry secrets).
+function replyDbUnavailable(err, req, res) {
+  if (!isDbUnavailable(err)) return false;
+  console.error(`[DB] ${req.method} ${req.path}: database unavailable (${err.causeCode || 'unknown'})`);
+  if (!res.headersSent) res.status(503).json({ error: 'Database unavailable' });
+  return true;
+}
 // Wraps pool.query/execute so connection-level failures surface as DbUnavailableError (strict mode only).
 function wrapDbPool(pool) {
   if (!strictMysql || !pool || pool.__dbWrapped) return pool;
@@ -407,9 +441,14 @@ function wrapDbPool(pool) {
     const original = pool[method].bind(pool);
     pool[method] = async (...args) => {
       try {
-        return await original(...args);
+        const result = await original(...args);
+        dbRuntimeDown = false;
+        return result;
       } catch (err) {
-        if (isDbConnectionError(err)) throw new DbUnavailableError(err);
+        if (isDbConnectionError(err)) {
+          dbRuntimeDown = true;
+          throw new DbUnavailableError(err);
+        }
         throw err;
       }
     };
@@ -1437,6 +1476,7 @@ async function validateSession(req) {
         session = rows[0];
       }
     } catch (e) {
+      if (isDbUnavailable(e)) throw e; // strict mode: never validate a session from memory while MySQL is down
       console.error("Session SQL validation error:", e.message);
     }
   }
@@ -1501,7 +1541,9 @@ async function invalidateSession(sessionToken) {
 
 // Authentication Middleware
 async function requireAuth(req, res, next) {
-  const employee = await validateSession(req);
+  let employee;
+  try { employee = await validateSession(req); }
+  catch (e) { if (replyDbUnavailable(e, req, res)) return; return next(e); }
   if (!employee) {
     return res.status(401).json({
       success: false,
@@ -1513,7 +1555,9 @@ async function requireAuth(req, res, next) {
 }
 
 async function requireAdmin(req, res, next) {
-  const employee = await validateSession(req);
+  let employee;
+  try { employee = await validateSession(req); }
+  catch (e) { if (replyDbUnavailable(e, req, res)) return; return next(e); }
   if (!employee) {
     return res.status(401).json({
       success: false,
@@ -1768,9 +1812,6 @@ async function finalizeEmployeeLogin(matchedUser, tabId, clientIp, req, res) {
     created_at: nowStr
   };
 
-  if (!memoryStore.sessions) memoryStore.sessions = [];
-  memoryStore.sessions.unshift(sessionRecord);
-
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
@@ -1779,8 +1820,13 @@ async function finalizeEmployeeLogin(matchedUser, tabId, clientIp, req, res) {
         [sessionRecord.id, sessionRecord.employee_id, sessionRecord.session_token_hash, sessionRecord.tab_id, sessionRecord.ip_address, sessionRecord.user_agent, sessionRecord.status, sessionRecord.last_seen, sessionRecord.expires_at, sessionRecord.created_at]
       );
       await dbPool.query(`UPDATE \`portal_users\` SET lastLogin = ? WHERE id = ?`, [nowStr, matchedUser.id]);
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return; // nothing was written to memory yet
+    }
   }
+
+  if (!memoryStore.sessions) memoryStore.sessions = [];
+  memoryStore.sessions.unshift(sessionRecord);
 
   matchedUser.lastLogin = nowStr;
   saveDiskDatabase();
@@ -1840,14 +1886,22 @@ app.post('/api/public/request-demo', async (req, res) => {
       status: 'NEW'
     };
 
-    if (!memoryStore.workspaceRequests) memoryStore.workspaceRequests = [];
-    memoryStore.workspaceRequests.unshift(lead);
+    // Strict mode: MySQL first; memory is touched only after the insert succeeded.
+    if (!strictMysql) {
+      if (!memoryStore.workspaceRequests) memoryStore.workspaceRequests = [];
+      memoryStore.workspaceRequests.unshift(lead);
+    }
     if (isMysqlConnected && dbPool) {
       try {
         await dbPool.query(`INSERT INTO \`workspace_requests\` (\`id\`, \`createdAt\`, \`status\`, \`data\`) VALUES (?, ?, ?, ?)`, [lead.id, lead.createdAt, lead.status, JSON.stringify(lead)]);
       } catch (e) {
+        if (replyDbUnavailable(e, req, res)) return;
         console.error('[LEAD] workspace_requests insert failed:', e.code || e.message);
       }
+    }
+    if (strictMysql) {
+      if (!memoryStore.workspaceRequests) memoryStore.workspaceRequests = [];
+      memoryStore.workspaceRequests.unshift(lead);
     }
     saveDiskDatabase();
 
@@ -1894,7 +1948,9 @@ app.post('/api/auth/login', async (req, res) => {
         [userIdentifier, userIdentifier]
       );
       if (rows && rows.length > 0) matchedUser = rows[0];
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
+    }
   }
 
   if (!matchedUser) {
@@ -2239,7 +2295,9 @@ app.post('/api/employees/:id/reset-2fa', requireAdmin, async (req, res) => {
 // POST /api/auth/logout
 app.post('/api/auth/logout', async (req, res) => {
   const sessionToken = req.cookies?.vps_session_id;
-  const employee = await validateSession(req);
+  let employee;
+  try { employee = await validateSession(req); }
+  catch (e) { if (replyDbUnavailable(e, req, res)) return; throw e; }
 
   if (sessionToken) {
     await invalidateSession(sessionToken);
@@ -2256,7 +2314,9 @@ app.post('/api/auth/logout', async (req, res) => {
 
 // GET /api/auth/me
 app.get('/api/auth/me', async (req, res) => {
-  const employee = await validateSession(req);
+  let employee;
+  try { employee = await validateSession(req); }
+  catch (e) { if (replyDbUnavailable(e, req, res)) return; throw e; }
   if (!employee) {
     return res.status(401).json({
       success: false,
@@ -2332,7 +2392,9 @@ app.get('/api/employees', requireAuth, async (req, res) => {
     try {
       const [rows] = await dbPool.query(`SELECT id, name, username, role, status, email, two_factor_enabled, lastLogin, createdAt FROM \`portal_users\` ORDER BY createdAt ASC`);
       return res.json({ success: true, source: 'mysql', employees: rows.map(toPublicEmployee) });
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
+    }
   }
 
   const safeEmployees = (memoryStore.portalUsers || defaultPortalUsers).map(u => toPublicEmployee({
@@ -2380,8 +2442,11 @@ app.post('/api/employees', requireAdmin, async (req, res) => {
     createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
   };
 
-  memoryStore.portalUsers.push(newEmployee);
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the insert succeeded.
+  if (!strictMysql) {
+    memoryStore.portalUsers.push(newEmployee);
+    saveDiskDatabase();
+  }
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -2390,7 +2455,13 @@ app.post('/api/employees', requireAdmin, async (req, res) => {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [newEmployee.id, newEmployee.name, newEmployee.username, newEmployee.password, newEmployee.role, newEmployee.status, newEmployee.email, newEmployee.createdAt]
       );
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
+    }
+  }
+  if (strictMysql) {
+    memoryStore.portalUsers.push(newEmployee);
+    saveDiskDatabase();
   }
 
   logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_CREATED', newEmployee.username, `Created employee ${newEmployee.name} (${newEmployee.role})`, req.clientIp);
@@ -2420,20 +2491,28 @@ app.put('/api/employees/:id', requireAdmin, async (req, res) => {
   }
 
   const emp = memoryStore.portalUsers[idx];
-  if (name) emp.name = name.trim();
-  if (email !== undefined) emp.email = email.trim();
-  if (role) emp.role = role;
-  if (status) emp.status = status;
+  // Strict mode: apply the change to a copy, write MySQL, and only then update memory.
+  const target = strictMysql ? { ...emp } : emp;
+  if (name) target.name = name.trim();
+  if (email !== undefined) target.email = email.trim();
+  if (role) target.role = role;
+  if (status) target.status = status;
 
-  saveDiskDatabase();
+  if (!strictMysql) saveDiskDatabase();
 
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
         `UPDATE \`portal_users\` SET name = ?, email = ?, role = ?, status = ? WHERE id = ?`,
-        [emp.name, emp.email, emp.role, emp.status, id]
+        [target.name, target.email, target.role, target.status, id]
       );
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
+    }
+  }
+  if (strictMysql) {
+    Object.assign(emp, target);
+    saveDiskDatabase();
   }
 
   logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_UPDATED', emp.username, `Updated employee ${emp.name}`, req.clientIp);
@@ -2605,6 +2684,11 @@ app.get('/api/servers', requireAuth, async (req, res) => {
   const roleKey = isSuperAdmin ? 'admin' : 'staff';
 
   // 1. Redis Cache Lookup
+  // Strict mode: a cached list is only served after the database answered a probe just now.
+  if (strictMysql) {
+    try { await dbPool.query('SELECT 1'); }
+    catch (e) { if (replyDbUnavailable(e, req, res)) return; throw e; }
+  }
   const cachedServers = await redisGet(`vps:servers:${roleKey}`);
   if (cachedServers) {
     return res.json({ success: true, source: 'redis', servers: cachedServers.map(toPublicServer) });
@@ -2631,7 +2715,9 @@ app.get('/api/servers', requireAuth, async (req, res) => {
       });
       memoryStore.servers = serverList;
       saveDiskDatabase();
-    } catch (err) {}
+    } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
+    }
   }
 
   if (serverList.length === 0) {
@@ -2690,19 +2776,23 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
     return res.status(500).json({ success: false, error: 'Unable to protect the server password' });
   }
 
-  if (idx >= 0) {
-    memoryStore.servers[idx] = newServer;
-  } else {
+  if (idx < 0) {
     // Remove the tombstones if explicitly re-added by admin (Req 10.12)
     try {
       await restoreServerTombstones(newServer);
     } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
       console.error('[ADD SERVER] Could not clear tombstones:', err.message);
       return res.status(500).json({ success: false, error: 'Unable to restore the server' });
     }
-    memoryStore.servers.push(newServer);
   }
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the write succeeded.
+  const applyServerToMemory = () => {
+    const i = memoryStore.servers.findIndex(item => item.id === newServer.id);
+    if (i >= 0) memoryStore.servers[i] = newServer; else memoryStore.servers.push(newServer);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyServerToMemory();
 
   // Invalidate Redis server caches
   await redisDel('vps:servers:admin');
@@ -2735,9 +2825,11 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
         ]
       );
     } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
       console.error("MySQL Server insert error:", err.message);
     }
   }
+  if (strictMysql) applyServerToMemory();
 
   logAudit(req.employee.name, req.employee.role, 'SERVER_CREATED', newServer.name, `Added VPS node ${newServer.name} (${newServer.ipPort})`, req.clientIp);
 
@@ -2994,12 +3086,13 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
   } catch {
     return res.status(500).json({ success: false, error: 'Unable to protect the server password' });
   }
-  if (idx >= 0) {
-    memoryStore.servers[idx] = s;
-  } else {
-    memoryStore.servers.push(s);
-  }
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the write succeeded.
+  const applyServerToMemory = () => {
+    const i = memoryStore.servers.findIndex(item => item.id === id);
+    if (i >= 0) memoryStore.servers[i] = s; else memoryStore.servers.push(s);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyServerToMemory();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -3028,9 +3121,11 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
         ]
       );
     } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
       console.error("MySQL Server update error:", err.message);
     }
   }
+  if (strictMysql) applyServerToMemory();
 
   logAudit(req.employee.name, req.employee.role, 'SERVER_UPDATED', s.name, `Updated VPS node ${s.name} (${s.ipPort})`, req.clientIp);
 
@@ -7481,7 +7576,7 @@ try {
     $cfgPath = "$agentDir\\agent-config.json"
     if (-not (Test-Path $cfgPath)) { [System.IO.File]::WriteAllText($cfgPath, "{}") }
     & icacls.exe "$cfgPath" /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" *>$null
-    $cfgJson = '{"serverId":"' + ($targetServerId -replace '[\\\\"]','') + '","portalBase":"' + $portalBase + '","serverToken":"vps_sec_token_default","agentKey":"${embeddedAgentKey}","intervalSeconds":5}'
+    $cfgJson = '{"serverId":"' + ($targetServerId -replace '[\\\\"]','') + '","portalBase":"' + $portalBase + '","agentKey":"${embeddedAgentKey}","intervalSeconds":5}'
     [System.IO.File]::WriteAllText($cfgPath, $cfgJson)
     Write-Host " [+] Agent key saved to agent-config.json (SYSTEM + Administrators only)" -ForegroundColor Green
 } catch {
@@ -8059,7 +8154,9 @@ app.get('/api/users', requireAuth, async (req, res) => {
       }
       const [rows] = await dbPool.query(query, params);
       clientList = rows;
-    } catch (err) {}
+    } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
+    }
   }
 
   if (clientList.length === 0 && memoryStore.users) {
@@ -8110,13 +8207,13 @@ app.post('/api/users', requireAuth, jobRouteHandler(async (req, res) => {
     u.salesAgent = req.employee.name || req.employee.username;
   }
 
-  const idx = memoryStore.users.findIndex(item => item.id === u.id);
-  if (idx >= 0) {
-    memoryStore.users[idx] = u;
-  } else {
-    memoryStore.users.unshift(u);
-  }
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the write succeeded.
+  const applyUserToMemory = () => {
+    const i = memoryStore.users.findIndex(item => item.id === u.id);
+    if (i >= 0) memoryStore.users[i] = u; else memoryStore.users.unshift(u);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyUserToMemory();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -8145,9 +8242,11 @@ app.post('/api/users', requireAuth, jobRouteHandler(async (req, res) => {
         ]
       );
     } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
       console.error("MySQL Client insert error:", err.message);
     }
   }
+  if (strictMysql) applyUserToMemory();
 
   logAudit(req.employee.name, req.employee.role, 'USER_CREATED', u.company, `Client created (${u.username} on ${u.drive})`, req.clientIp);
 
@@ -8320,13 +8419,13 @@ app.put('/api/users/:id', requireAuth, jobRouteHandler(async (req, res) => {
     return res.status(500).json({ success: false, error: 'Unable to protect the password' });
   }
 
-  const idx = memoryStore.users.findIndex(item => item.id === id);
-  if (idx >= 0) {
-    memoryStore.users[idx] = u;
-  } else {
-    memoryStore.users.unshift(u);
-  }
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the write succeeded.
+  const applyUserToMemory = () => {
+    const i = memoryStore.users.findIndex(item => item.id === id);
+    if (i >= 0) memoryStore.users[i] = u; else memoryStore.users.unshift(u);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyUserToMemory();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -8355,9 +8454,11 @@ app.put('/api/users/:id', requireAuth, jobRouteHandler(async (req, res) => {
         ]
       );
     } catch (err) {
+      if (replyDbUnavailable(err, req, res)) return;
       console.error("MySQL Client update error:", err.message);
     }
   }
+  if (strictMysql) applyUserToMemory();
 
   if (existing && u.status && existing.status !== u.status) {
     const isEnabled = u.status !== 'DISABLED' && u.status !== 'Disabled';
@@ -8943,9 +9044,10 @@ async function runLegacyEntityImport() {
 app.get('/api/requests', requireAuth, async (req, res) => {
   let reqList = memoryStore.requests || [];
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try { reqList = await es.list('requests'); }
-    catch (e) { console.error('[Requests] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load requests' }); }
+    catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Requests] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load requests' }); }
   }
   if (req.employee.role === 'SALESPERSON') {
     const agentName = (req.employee.name || '').toLowerCase();
@@ -8964,11 +9066,12 @@ app.post('/api/requests', requireAuth, async (req, res) => {
     newReq.salesAgent = req.employee.name || req.employee.username;
   }
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try {
       if (newReq.id === undefined || newReq.id === null || newReq.id === '') newReq.id = `REQ-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
       await es.put('requests', newReq);
-    } catch (e) { console.error('[Requests] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save request' }); }
+    } catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Requests] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save request' }); }
   } else {
     if (!memoryStore.requests) memoryStore.requests = [];
     memoryStore.requests.unshift(newReq);
@@ -8983,11 +9086,12 @@ app.put('/api/requests/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const update = req.body;
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try {
       const existing = await es.get('requests', id);
       if (existing) await es.put('requests', { ...existing, ...update, id: existing.id });
-    } catch (e) { console.error('[Requests] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update request' }); }
+    } catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Requests] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update request' }); }
   } else if (memoryStore.requests) {
     memoryStore.requests = memoryStore.requests.map(r => r.id === id ? { ...r, ...update } : r);
     saveDiskDatabase();
@@ -9000,9 +9104,10 @@ app.put('/api/requests/:id', requireAuth, async (req, res) => {
 app.get('/api/renewals', requireAuth, async (req, res) => {
   let renewals = memoryStore.renewals || [];
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try { renewals = await es.list('renewals'); }
-    catch (e) { console.error('[Renewals] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load renewals' }); }
+    catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Renewals] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load renewals' }); }
   }
   res.json({ success: true, renewals });
 });
@@ -9012,11 +9117,12 @@ app.post('/api/renewals', requireAuth, async (req, res) => {
   const newRen = req.body;
   newRen.requestedBy = req.employee.name;
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try {
       if (newRen.id === undefined || newRen.id === null || newRen.id === '') newRen.id = `REN-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
       await es.put('renewals', newRen);
-    } catch (e) { console.error('[Renewals] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save renewal' }); }
+    } catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Renewals] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save renewal' }); }
   } else {
     if (!memoryStore.renewals) memoryStore.renewals = [];
     memoryStore.renewals.unshift(newRen);
@@ -9031,11 +9137,12 @@ app.put('/api/renewals/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const update = req.body;
   const es = getEntityStore();
+  if (!es && strictMysql) return replyDbUnavailable(new DbUnavailableError({ code: 'NO_ENTITY_STORE' }), req, res);
   if (es) {
     try {
       const existing = await es.get('renewals', id);
       if (existing) await es.put('renewals', { ...existing, ...update, id: existing.id });
-    } catch (e) { console.error('[Renewals] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update renewal' }); }
+    } catch (e) { if (replyDbUnavailable(e, req, res)) return; console.error('[Renewals] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update renewal' }); }
   } else if (memoryStore.renewals) {
     memoryStore.renewals = memoryStore.renewals.map(r => r.id === id ? { ...r, ...update } : r);
     saveDiskDatabase();
@@ -9209,9 +9316,13 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
     createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
   };
 
-  if (!memoryStore.tickets) memoryStore.tickets = [];
-  memoryStore.tickets.unshift(newTicket);
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the insert succeeded.
+  const applyTicketToMemory = () => {
+    if (!memoryStore.tickets) memoryStore.tickets = [];
+    memoryStore.tickets.unshift(newTicket);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyTicketToMemory();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -9244,9 +9355,11 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
         ]
       );
     } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
       console.error("MySQL Ticket insert error:", e.message);
     }
   }
+  if (strictMysql) applyTicketToMemory();
 
   logAudit(req.employee.name, req.employee.role, 'TICKET_CREATED', newTicket.id, `Created support ticket for ${newTicket.company} (${newTicket.issueCategory}) [Status: ${newTicket.status}]`, req.clientIp);
 
@@ -9321,8 +9434,12 @@ app.post('/api/tickets/:id/claim', requireAuth, async (req, res) => {
     status: 'IN_PROGRESS'
   };
 
-  memoryStore.tickets[idx] = updatedTicket;
-  saveDiskDatabase();
+  const applyClaim = () => {
+    const i = memoryStore.tickets.findIndex(t => t.id === id);
+    if (i >= 0) memoryStore.tickets[i] = updatedTicket;
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyClaim();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -9333,9 +9450,11 @@ app.post('/api/tickets/:id/claim', requireAuth, async (req, res) => {
         [staffName, staffEmail, 'IN_PROGRESS', id]
       );
     } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
       console.error("MySQL Claim Ticket error:", e.message);
     }
   }
+  if (strictMysql) applyClaim();
 
   logAudit(staffName, req.employee.role, 'TICKET_CLAIMED', id, `${staffName} claimed and started working on ticket ${id}`, req.clientIp);
 
@@ -9429,6 +9548,12 @@ app.post('/api/public/tickets', async (req, res) => {
   const resolvedServer = client ? (client.serverName || client.serverId || serverName || 'VPS Node') : (serverName || 'VPS Node');
   const resolvedDrive = client ? (client.drive || drive || 'Drive D') : (drive || 'Drive D');
 
+  // Strict mode: confirm MySQL is reachable before anything is generated, written to disk or held in memory.
+  if (strictMysql) {
+    try { await dbPool.query('SELECT 1'); }
+    catch (e) { if (replyDbUnavailable(e, req, res)) return; throw e; }
+  }
+
   const ticketId = await generateNextTicketId(company || username);
   let voiceNoteUrl = '';
   if (audioBase64) {
@@ -9460,10 +9585,6 @@ app.post('/api/public/tickets', async (req, res) => {
     createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
   };
 
-  if (!memoryStore.tickets) memoryStore.tickets = [];
-  memoryStore.tickets.unshift(newTicket);
-  saveDiskDatabase();
-
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
@@ -9478,9 +9599,14 @@ app.post('/api/public/tickets', async (req, res) => {
         ]
       );
     } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return; // nothing was added to memory yet
       console.error("MySQL Public Ticket insert error:", e.message);
     }
   }
+
+  if (!memoryStore.tickets) memoryStore.tickets = [];
+  memoryStore.tickets.unshift(newTicket);
+  saveDiskDatabase();
 
   logAudit('Customer Portal', 'CUSTOMER', 'PUBLIC_TICKET_RAISED', newTicket.id, `Customer ${company} raised ticket ${newTicket.id} via Support Portal`, req.clientIp);
 
@@ -9529,8 +9655,13 @@ app.put('/api/tickets/:id', requireAuth, async (req, res) => {
     resolvedAt: isNowResolved ? new Date().toISOString().replace('T', ' ').substring(0, 19) : (updates.resolvedAt || existingTicket.resolvedAt)
   };
 
-  memoryStore.tickets[idx] = updatedTicket;
-  saveDiskDatabase();
+  // Strict mode: MySQL first; memory is touched only after the update succeeded.
+  const applyTicketUpdate = () => {
+    const i = memoryStore.tickets.findIndex(t => t.id === id);
+    if (i >= 0) memoryStore.tickets[i] = updatedTicket;
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyTicketUpdate();
 
   if (isMysqlConnected && dbPool) {
     try {
@@ -9548,9 +9679,11 @@ app.put('/api/tickets/:id', requireAuth, async (req, res) => {
         ]
       );
     } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
       console.error("MySQL Ticket update error:", e.message);
     }
   }
+  if (strictMysql) applyTicketUpdate();
 
   logAudit(req.employee.name, req.employee.role, isNowResolved ? 'TICKET_RESOLVED' : 'TICKET_UPDATED', id, `Updated ticket ${id} -> ${updatedTicket.status}`, req.clientIp);
 
@@ -9597,14 +9730,20 @@ app.put('/api/tickets/:id', requireAuth, async (req, res) => {
 app.delete('/api/tickets/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
 
-  memoryStore.tickets = (memoryStore.tickets || []).filter(t => t.id !== id);
-  saveDiskDatabase();
+  const applyTicketDelete = () => {
+    memoryStore.tickets = (memoryStore.tickets || []).filter(t => t.id !== id);
+    saveDiskDatabase();
+  };
+  if (!strictMysql) applyTicketDelete();
 
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(`DELETE FROM \`support_tickets\` WHERE \`id\` = ?`, [id]);
-    } catch (e) {}
+    } catch (e) {
+      if (replyDbUnavailable(e, req, res)) return;
+    }
   }
+  if (strictMysql) applyTicketDelete();
 
   logAudit(req.employee.name, req.employee.role, 'TICKET_DELETED', id, `Deleted support ticket ${id}`, req.clientIp);
 

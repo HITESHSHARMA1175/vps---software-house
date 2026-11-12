@@ -65,6 +65,28 @@ describe('Property 7: Public serializers never expose passwords', () => {
     );
   });
 
+  it('toPublicServer never emits apiKey, previousApiKey or previousKeyExpiresAt at any depth', () => {
+    const KEYS = ['apiKey', 'previousApiKey', 'previousKeyExpiresAt'];
+    const leaf = fc.oneof(fc.string(), fc.integer(), fc.constant(null));
+    const tree = fc.letrec((tie) => ({
+      node: fc.oneof(
+        { depthSize: 'small', withCrossShrink: true },
+        leaf,
+        fc.array(tie('node'), { maxLength: 3 }),
+        fc.dictionary(fc.oneof(fc.constantFrom(...KEYS), fc.constantFrom('name', 'child', 'id')), tie('node'), { maxKeys: 5 })
+      ),
+    })).node;
+    const root = fc.dictionary(fc.oneof(fc.constantFrom(...KEYS), fc.constantFrom('name', 'child', 'list')), tree, { maxKeys: 6 });
+    fc.assert(
+      fc.property(root, (obj) => {
+        const keys = [];
+        walkKeys(toPublicServer(obj), (k) => keys.push(k));
+        for (const f of KEYS) expect(keys).not.toContain(f);
+      }),
+      { numRuns: 200 }
+    );
+  });
+
   it('preserves non-secret fields', () => {
     fc.assert(
       fc.property(baseObject, (obj) => {

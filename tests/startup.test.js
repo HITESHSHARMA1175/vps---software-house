@@ -120,25 +120,77 @@ describe('production runtime outage (Req 11.2)', () => {
     expect(fs.existsSync(process.env.DB_FILE_PATH)).toBe(false);
   });
 
-  // PRODUCT GAP (reported, server.js not modified): DbUnavailableError is raised by the wrapped pool, but
-  // express 4 async handlers swallow it (try/catch -> 500 "Failed to load requests") or the route falls back
-  // to in-memory data (GET /api/servers, /api/employees answer 200). Flip to a normal `it` once the routes
-  // forward the error to the final handler, which answers 503 { error: 'Database unavailable' }.
-  it.fails('answers 503 { error: "Database unavailable" } for a read that needs MySQL', async () => {
+  const DOWN = { error: 'Database unavailable' };
+  const listHas = async (app, cookie, path, text) => {
+    const r = await request(app).get(path).set('Cookie', cookie);
+    expect(r.status).toBe(200);
+    return JSON.stringify(r.body).includes(text);
+  };
+
+  it('answers 503 { error: "Database unavailable" } for a read that needs MySQL', async () => {
     const { app, cookie } = await outageApp();
     const res = await request(app).get('/api/requests').set('Cookie', cookie);
     expect(res.status).toBe(503);
-    expect(res.body).toEqual({ error: 'Database unavailable' });
+    expect(res.body).toEqual(DOWN);
   });
 
-  // PRODUCT GAP: a public write is accepted (201) into memory while MySQL is down, and is lost on restart.
-  it.fails('rejects a write with 503 instead of accepting it into memory', async () => {
+  it('rejects a write with 503 instead of accepting it into memory', async () => {
     const { app } = await outageApp();
     const res = await request(app).post('/api/public/tickets').send({ username: 'a', phone: '1', subject: 's', description: 'd' });
     expect(res.status).toBe(503);
   });
-});
 
+  it('public ticket: 503 exact body and nothing accepted into memory', async () => {
+    const { app, cookie } = await outageApp();
+    const subject = `outage-public-${Date.now()}`;
+    const res = await request(app).post('/api/public/tickets').send({ username: 'a', phone: '1', subject, description: 'd' });
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual(DOWN);
+    fake().setUnavailable(false);
+    expect(await listHas(app, cookie, '/api/tickets', subject)).toBe(false);
+  });
+
+  it('staff routes: GET /api/servers and POST /api/tickets answer 503; the ticket is not kept', async () => {
+    const { app, cookie } = await outageApp();
+    const subject = `outage-staff-${Date.now()}`;
+    const s = await request(app).get('/api/servers').set('Cookie', cookie);
+    expect(s.status).toBe(503);
+    expect(s.body).toEqual(DOWN);
+    const t = await request(app).post('/api/tickets').set('Cookie', cookie).send({ company: 'Acme', subject, description: 'd' });
+    expect(t.status).toBe(503);
+    expect(t.body).toEqual(DOWN);
+    fake().setUnavailable(false);
+    expect(await listHas(app, cookie, '/api/tickets', subject)).toBe(false);
+  });
+
+  it('first-failure window: a mutating staff request right after the outage starts gets 503 and is not kept', async () => {
+    const { app, cookie } = await outageApp();
+    const username = `outage_emp_${Date.now()}`;
+    const res = await request(app).post('/api/employees').set('Cookie', cookie)
+      .send({ name: 'Outage Emp', username, password: 'Outage-Pass-1!', role: 'STAFF' });
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual(DOWN);
+    fake().setUnavailable(false);
+    expect(await listHas(app, cookie, '/api/employees', username)).toBe(false);
+  });
+
+  it('recovers: GET /api/servers returns 200 once MySQL is back', async () => {
+    const { app, cookie } = await outageApp();
+    expect((await request(app).get('/api/servers').set('Cookie', cookie)).status).toBe(503);
+    fake().setUnavailable(false);
+    expect((await request(app).get('/api/servers').set('Cookie', cookie)).status).toBe(200);
+  });
+
+  it('non-strict (NODE_ENV=test): fallback behaviour is unchanged while MySQL is down', async () => {
+    vi.spyOn(process, 'exit').mockImplementation(() => undefined);
+    const app = await boot({ NODE_ENV: 'test' });
+    const h = await import('./helpers/app.js');
+    const { cookie } = await h.loginAs(app, 'admin');
+    fake().setUnavailable(true);
+    const res = await request(app).get('/api/servers').set('Cookie', cookie);
+    expect(res.status).toBe(200);
+  });
+});
 describe('PORTAL_BASE_URL rules (Req 13.6, 13.7)', () => {
   const prodEnv = (extra) => ({ NODE_ENV: 'production', PASSWORD_ENCRYPTION_KEY: KEY, ...extra });
   const problemsOf = (env) => {

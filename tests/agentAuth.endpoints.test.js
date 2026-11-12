@@ -240,10 +240,7 @@ describe('Agent key rotation', () => {
     expect(JSON.stringify(list.body)).not.toContain(newKey);
   });
 
-  // PRODUCT BUG (reported in the task 36.2 Change_Report): GET /api/servers returns each server's `apiKey`
-  // (the Agent_Key_Hash) to staff, although POST /api/servers deliberately omits it and toPublicServer does not
-  // strip it. Flip to a normal `it` once the list projection removes `apiKey`.
-  it.fails('does not expose the Agent_Key_Hash in GET /api/servers', async () => {
+  it('does not expose the Agent_Key_Hash in GET /api/servers', async () => {
     const list = await request(app).get('/api/servers').set('Cookie', cookie);
     expect(JSON.stringify(list.body)).not.toMatch(/"apiKey"\s*:\s*"[0-9a-f]{64}"/);
   });

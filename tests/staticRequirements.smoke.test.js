@@ -85,9 +85,7 @@ describe('static requirements smoke checks', () => {
     }
   });
 
-  // PRODUCT BUG: server.js line ~7408 embeds a PowerShell template that writes
-  // "serverToken":"vps_sec_token_default" into agent-config.json.
-  it.fails('server.js has no serverToken reference (product bug: install template ~line 7408)', () => {
+  it('server.js has no serverToken reference', () => {
     expect(serverJs).not.toContain('serverToken');
   });
 
