@@ -36,16 +36,53 @@ function Test-IsAdmin {
 
 if (-not (Test-IsAdmin)) {
     Write-Host "Elevating privileges to Administrator..." -ForegroundColor Yellow
-    $argsList = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-    if ($CompanyName) { $argsList += " -CompanyName `"$CompanyName`"" }
-    if ($Username) { $argsList += " -Username `"$Username`"" }
-    if ($Password) { $argsList += " -Password `"$Password`"" }
-    if ($DriveLetter) { $argsList += " -DriveLetter `"$DriveLetter`"" }
-    if ($CLI) { $argsList += " -CLI" }
-    if ($NonInteractive) { $argsList += " -NonInteractive" }
+    # Hardening (16.6): build the argument list as an array and quote each value per the
+    # Windows command-line rules, so a quote, backslash, or space in a value cannot break out.
+    function ConvertTo-QuotedArg ([string]$Value) {
+        $v = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+        $v = [regex]::Replace($v, '(\\+)$', '$1$1')
+        return '"' + $v + '"'
+    }
+    $argsList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (ConvertTo-QuotedArg $PSCommandPath))
+    if ($CompanyName) { $argsList += @('-CompanyName', (ConvertTo-QuotedArg $CompanyName)) }
+    if ($Username) { $argsList += @('-Username', (ConvertTo-QuotedArg $Username)) }
+    if ($Password) { $argsList += @('-Password', (ConvertTo-QuotedArg $Password)) }
+    if ($DriveLetter) { $argsList += @('-DriveLetter', (ConvertTo-QuotedArg $DriveLetter)) }
+    if ($CLI) { $argsList += '-CLI' }
+    if ($NonInteractive) { $argsList += '-NonInteractive' }
     
     Start-Process powershell.exe -Verb RunAs -ArgumentList $argsList
     exit
+}
+
+# -----------------------------------------------------------------------------
+# Agent_Key support (Req 5): read the key from the agent configuration and send
+# it as the X-Agent-Key header on any Agent_Endpoint request made by this script.
+# -----------------------------------------------------------------------------
+$script:AgentConfigFile = Join-Path $env:ProgramData "InnovationWebWorks\VpsAgent\agent-config.json"
+
+function Get-AgentKey {
+    # Returns $null if the key is missing, empty, or unreadable.
+    try {
+        if (-not (Test-Path $script:AgentConfigFile)) { return $null }
+        $conf = Get-Content $script:AgentConfigFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($conf -and $conf.agentKey) {
+            $k = ([string]$conf.agentKey).Trim()
+            if ($k) { return $k }
+        }
+    } catch {}
+    return $null
+}
+
+function Get-AgentRequestHeaders {
+    # Headers for Invoke-RestMethod/Invoke-WebRequest calls to Agent_Endpoints.
+    # Returns $null (caller must skip the request) when no key is available.
+    $agentKey = Get-AgentKey
+    if (-not $agentKey) {
+        Write-Host " [WARN] Agent_Key missing, empty, or unreadable in agent-config.json; agent request skipped." -ForegroundColor Yellow
+        return $null
+    }
+    return @{ "X-Agent-Key" = $agentKey }
 }
 
 # -----------------------------------------------------------------------------
@@ -161,6 +198,10 @@ function Invoke-TallyProvisioning {
         $driveClean = $TargetDrive.TrimEnd('\')
         if (-not $driveClean.EndsWith(':')) { $driveClean = "$driveClean`:" }
 
+        # Hardening (16.6): allowlist values that reach native command lines
+        if ($UsrName -notmatch '^[A-Za-z0-9._-]{1,64}$') { throw "Username may contain only letters, digits, '.', '_' and '-' (max 64 characters)." }
+        if ($driveClean -notmatch '^[A-Za-z]:$') { throw "Target Drive must be a single drive letter." }
+
         $companyRoot = "$driveClean\$sanitizedFolder"
         $tallyDir = "$companyRoot\Tally"
         $tallyDataDir = "$companyRoot\Data"
@@ -201,7 +242,7 @@ function Invoke-TallyProvisioning {
             Write-StepLog "User '$UsrName' already exists. Updating credentials & description..." "WARN"
             Set-LocalUser -Name $UsrName -Password $secPass -Description "Tally Client - $CompName" -PasswordNeverExpires $true
         } else {
-            New-LocalUser -Name $UsrName -Password $secPass -FullName $CompName -Description "Tally Client - $CompName" -PasswordNeverExpires $true | Out-Null
+            New-LocalUser -Name $UsrName -Password $secPass -FullName $CompName -Description "Tally Client - $CompName" -PasswordNeverExpires | Out-Null
             Write-StepLog "Windows Local User '$UsrName' created successfully." "SUCCESS"
         }
 
@@ -225,9 +266,10 @@ function Invoke-TallyProvisioning {
             $driveRoot = "$driveClean\"
             Write-StepLog "Applying Full Drive-Level Zero-Trust NTFS Isolation on $driveRoot for '$UsrName'..." "INFO"
             
-            & icacls.exe "$driveRoot" /inheritance:r 2>$null | Out-Null
-            & icacls.exe "$driveRoot" /remove:g "Users" "Everyone" "Authenticated Users" 2>$null | Out-Null
-            & icacls.exe "$driveRoot" /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "$UsrName`:(OI)(CI)F" "superclient:(OI)(CI)F" 2>$null | Out-Null
+            $userGrantF = $UsrName + ':(OI)(CI)F'
+            & icacls.exe $driveRoot '/inheritance:r' 2>$null | Out-Null
+            & icacls.exe $driveRoot '/remove:g' 'Users' 'Everyone' 'Authenticated Users' 2>$null | Out-Null
+            & icacls.exe $driveRoot '/grant:r' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' $userGrantF 'superclient:(OI)(CI)F' 2>$null | Out-Null
 
             $driveAcl = Get-Acl -Path $driveRoot -ErrorAction SilentlyContinue
             if ($driveAcl) {
@@ -247,14 +289,15 @@ function Invoke-TallyProvisioning {
                 Set-Acl -Path $driveRoot -AclObject $driveAcl -ErrorAction SilentlyContinue
             }
 
-            try { & icacls.exe "$companyRoot" /inheritance:e 2>$null | Out-Null } catch {}
+            try { & icacls.exe $companyRoot '/inheritance:e' 2>$null | Out-Null } catch {}
             Write-StepLog "Full Drive-Level NTFS Permissions applied on $driveRoot." "SUCCESS"
         } else {
             Write-StepLog "Applying Directory-Level Zero-Trust NTFS Isolation on $companyRoot..." "INFO"
             
-            & icacls.exe "$companyRoot" /inheritance:r 2>$null | Out-Null
-            & icacls.exe "$companyRoot" /remove:g "Users" "Everyone" "Authenticated Users" 2>$null | Out-Null
-            & icacls.exe "$companyRoot" /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "$UsrName`:(OI)(CI)F" "superclient:(OI)(CI)F" 2>$null | Out-Null
+            $userGrantF = $UsrName + ':(OI)(CI)F'
+            & icacls.exe $companyRoot '/inheritance:r' 2>$null | Out-Null
+            & icacls.exe $companyRoot '/remove:g' 'Users' 'Everyone' 'Authenticated Users' 2>$null | Out-Null
+            & icacls.exe $companyRoot '/grant:r' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' $userGrantF 'superclient:(OI)(CI)F' 2>$null | Out-Null
 
             $acl = New-Object System.Security.AccessControl.DirectorySecurity
             $acl.SetAccessRuleProtection($true, $false)
@@ -279,8 +322,12 @@ function Invoke-TallyProvisioning {
         if ($TallyTemplate -and (Test-Path "$TallyTemplate\tally.exe")) {
             Write-StepLog "Copying Tally binaries from master template: $TallyTemplate ..." "INFO"
             
-            $robocopyCmd = "robocopy `"$TallyTemplate`" `"$tallyDir`" /E /NFL /NDL /NJH /NJS /nc /ns /np /XD `"$TallyTemplate\Data`" `"$TallyTemplate\logs`""
-            Invoke-Expression $robocopyCmd | Out-Null
+            $robocopyArgs = @(
+                $TallyTemplate, $tallyDir,
+                '/E', '/NFL', '/NDL', '/NJH', '/NJS', '/nc', '/ns', '/np',
+                '/XD', (Join-Path $TallyTemplate 'Data'), (Join-Path $TallyTemplate 'logs')
+            )
+            & robocopy.exe @robocopyArgs | Out-Null
 
             Write-StepLog "Tally binaries deployed to $tallyDir." "SUCCESS"
         } else {
@@ -324,7 +371,8 @@ Sound = Yes
 
         # Configure permissions on tally.ini (Full Control for Administrators, SYSTEM & superclient, Modify for client user)
         try {
-            & icacls "$tallyIniPath" /inheritance:r /grant:r "Administrators:(F)" "SYSTEM:(F)" "superclient:(F)" "$($Username):(M)" /Q 2>$null
+            $userGrantM = $UsrName + ':(M)'
+            & icacls.exe $tallyIniPath '/inheritance:r' '/grant:r' 'Administrators:(F)' 'SYSTEM:(F)' 'superclient:(F)' $userGrantM '/Q' 2>$null
             Write-StepLog "Configured tally.ini: User ($Username)=Modify, Administrators/superclient=Full Control" "SUCCESS"
         } catch {}
 

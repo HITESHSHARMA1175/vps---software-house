@@ -13,7 +13,7 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $target_url = 'http://127.0.0.1:5000' . $request_uri;
 
 $headers = array();
-$blocked_headers = array('host', 'content-length', 'connection', 'keep-alive', 'x-internal-secret', 'x-server-secret');
+$blocked_headers = array('host', 'content-length', 'connection', 'keep-alive', 'x-internal-secret', 'x-server-secret', 'x-forwarded-for', 'x-real-ip', 'cf-connecting-ip', 'forwarded');
 
 if (function_exists('getallheaders')) {
     foreach (getallheaders() as $name => $value) {
@@ -35,7 +35,8 @@ if (function_exists('getallheaders')) {
 }
 
 // Forward Client Real IP and Host
-$client_ip = $_SERVER['HTTP_CF_CONNECTING_IP'] ?? $_SERVER['HTTP_X_FORWARDED_FOR'] ?? $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
+// Client-supplied IP headers are blocked above; the only trusted value is the TCP peer address.
+$client_ip = $_SERVER['REMOTE_ADDR'] ?? '127.0.0.1';
 $headers[] = "X-Forwarded-For: " . $client_ip;
 $headers[] = "X-Real-IP: " . $client_ip;
 $headers[] = "X-Forwarded-Host: " . ($_SERVER['HTTP_HOST'] ?? 'vps.innovationwebworks.in');

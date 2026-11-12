@@ -31,6 +31,8 @@ import { getDaysRemaining, getExpiryCategory } from '../UserTable';
 import { downloadVpsSubscriptionTemplate } from '../../utils/exportUtils';
 import ActionsDropdown from '../ui/ActionsDropdown';
 import MigrateClientModal from '../MigrateClientModal';
+import { useAuth, API_BASE } from '../../contexts/AuthContext';
+import { revealClientPassword, revealServerPassword, copyRevealedPassword, MASKED_PASSWORD_TEXT } from '../../utils/revealPassword';
 
 const EMPTY_ARRAY = [];
 
@@ -83,10 +85,17 @@ export default function UsersView({
   const canRenewClient = isSuperAdmin || (employeePermissions && employeePermissions.canRenewClient);
   const canExport = isSuperAdmin || (employeePermissions && employeePermissions.canExport);
 
-  const copyTextToClipboard = (text, keyName) => {
-    navigator.clipboard.writeText(text);
-    setCopiedKey(keyName);
-    setTimeout(() => setCopiedKey(null), 1500);
+  const { authFetch } = useAuth();
+
+  // SUPER_ADMIN only: fetch the password on click, copy it, and discard it (never kept in state)
+  const revealAndCopy = async (fetcher, keyName) => {
+    try {
+      await copyRevealedPassword(fetcher);
+      setCopiedKey(keyName);
+      setTimeout(() => setCopiedKey(null), 1500);
+    } catch (err) {
+      window.alert(`Reveal failed: ${err.message}`);
+    }
   };
 
   // Filtered & Sorted Users
@@ -398,9 +407,6 @@ export default function UsersView({
                   const isChecked = selectedSet.has(user.id);
                   const connectivity = getServerConnectivity(server);
 
-                  const userPassword = user.password || 'Pass#123';
-                  const superPass = server ? (server.superClientPass || 'Pass#123') : 'Pass#123';
-
                   const waMessage = encodeURIComponent(
                     `Hello ${user.company},\n\nYour VPS Cloud Subscription (${server ? server.name : 'VPS'}) expires on ${user.expiryDate} (${daysRemaining} days remaining).\n\nThank you,\nInnovation Web Works Operations`
                   );
@@ -426,29 +432,37 @@ export default function UsersView({
                         <div className="font-mono" style={{ fontWeight: '700', color: 'var(--text-primary)', marginBottom: '3px' }}>
                           {user.username}
                         </div>
-                        <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
-                          <button
-                            type="button"
-                            title="Click to copy user password"
-                            onClick={() => copyTextToClipboard(userPassword, `user-${user.id}`)}
-                            className="btn btn-ghost btn-xs"
-                            style={{ padding: '2px 5px', fontSize: '10px', color: 'var(--accent-emerald)', height: '18px' }}
-                          >
-                            {copiedKey === `user-${user.id}` ? <Check size={10} /> : <Key size={10} />}
-                            User Pass
-                          </button>
+                        {isSuperAdmin ? (
+                          <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                            <button
+                              type="button"
+                              title="Reveal and copy user password (audited)"
+                              onClick={() => revealAndCopy(() => revealClientPassword(authFetch, API_BASE, user.id), `user-${user.id}`)}
+                              className="btn btn-ghost btn-xs"
+                              style={{ padding: '2px 5px', fontSize: '10px', color: 'var(--accent-emerald)', height: '18px' }}
+                            >
+                              {copiedKey === `user-${user.id}` ? <Check size={10} /> : <Key size={10} />}
+                              Reveal User Pass
+                            </button>
 
-                          <button
-                            type="button"
-                            title="Click to copy super admin password"
-                            onClick={() => copyTextToClipboard(superPass, `super-${user.id}`)}
-                            className="btn btn-ghost btn-xs"
-                            style={{ padding: '2px 5px', fontSize: '10px', color: 'var(--accent-amber)', height: '18px' }}
-                          >
-                            {copiedKey === `super-${user.id}` ? <Check size={10} /> : <Shield size={10} />}
-                            Super Pass
-                          </button>
-                        </div>
+                            {server && (
+                              <button
+                                type="button"
+                                title="Reveal and copy super admin password (audited)"
+                                onClick={() => revealAndCopy(() => revealServerPassword(authFetch, API_BASE, server.id), `super-${user.id}`)}
+                                className="btn btn-ghost btn-xs"
+                                style={{ padding: '2px 5px', fontSize: '10px', color: 'var(--accent-amber)', height: '18px' }}
+                              >
+                                {copiedKey === `super-${user.id}` ? <Check size={10} /> : <Shield size={10} />}
+                                Reveal Super Pass
+                              </button>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="font-mono" style={{ fontSize: '10px', color: 'var(--text-muted)' }} title="Passwords are visible to Super Admin only">
+                            Password: {MASKED_PASSWORD_TEXT}
+                          </div>
+                        )}
                       </td>
 
                       {/* Company Name */}

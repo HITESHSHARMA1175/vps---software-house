@@ -160,6 +160,37 @@ try {
   return { wrapper, rawLength: rawCode.length, encLength: wrapper.length };
 }
 
+/**
+ * Post-build check (Req 5.4): decrypts a generated bundle exactly as the PowerShell
+ * wrapper does (AES-256-CBC, then GZip) and fails if the decrypted code does not
+ * contain the X-Agent-Key header logic.
+ */
+export function verifyBundleHasAgentKey(bundlePath) {
+  const text = fs.readFileSync(bundlePath, 'utf8');
+  const keyMatch = text.match(/\$k = \[System\.Convert\]::FromBase64String\("([^"]+)"\)/);
+  const ivMatch = text.match(/\$v = \[System\.Convert\]::FromBase64String\("([^"]+)"\)/);
+  const payloadMatch = text.match(/\$p = \(-join @\(([\s\S]*?)\)\)/);
+  if (!keyMatch || !ivMatch || !payloadMatch) {
+    throw new Error(`Bundle check failed: cannot parse key/iv/payload in ${bundlePath}`);
+  }
+  const payloadB64 = [...payloadMatch[1].matchAll(/"([^"]*)"/g)].map(m => m[1]).join('');
+  const decipher = crypto.createDecipheriv(
+    'aes-256-cbc',
+    Buffer.from(keyMatch[1], 'base64'),
+    Buffer.from(ivMatch[1], 'base64')
+  );
+  const compressed = Buffer.concat([decipher.update(Buffer.from(payloadB64, 'base64')), decipher.final()]);
+  const code = zlib.gunzipSync(compressed).toString('utf8');
+  const rel = path.relative(rootDir, bundlePath);
+  if (!code.includes('X-Agent-Key')) {
+    throw new Error(`Bundle check failed: X-Agent-Key missing in decrypted ${rel}`);
+  }
+  if (!/function\s+Get-AgentKey/.test(code)) {
+    throw new Error(`Bundle check failed: Get-AgentKey missing in decrypted ${rel}`);
+  }
+  console.log(`  ✔ Verified: X-Agent-Key present in decrypted ${rel}`);
+}
+
 export function buildAllProtectedScripts() {
   console.log('🔒 ====================================================================');
   console.log('🔒 INNOVATION WEB WORKS - AUTOMATED SCRIPT ENCRYPTION & SECURITY BUILD');
@@ -179,6 +210,7 @@ export function buildAllProtectedScripts() {
     vpsAgentTargets.forEach(dest => {
       fs.writeFileSync(dest, wrapper, 'utf8');
       console.log(`  └── Generated: ${path.relative(rootDir, dest)}`);
+      verifyBundleHasAgentKey(dest);
     });
 
     console.log(`  [+] VpsAgent.ps1 encrypted successfully! Raw: ${(rawLength / 1024).toFixed(1)} KB -> Protected: ${(encLength / 1024).toFixed(1)} KB\n`);
@@ -199,6 +231,7 @@ export function buildAllProtectedScripts() {
     tallyTargets.forEach(dest => {
       fs.writeFileSync(dest, wrapper, 'utf8');
       console.log(`  └── Generated: ${path.relative(rootDir, dest)}`);
+      verifyBundleHasAgentKey(dest);
     });
 
     console.log(`  [+] Create_Tally_User.ps1 encrypted successfully! Raw: ${(rawLength / 1024).toFixed(1)} KB -> Protected: ${(encLength / 1024).toFixed(1)} KB\n`);

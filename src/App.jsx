@@ -59,6 +59,14 @@ import { useNavigation } from './hooks/useNavigation';
 import { useServers } from './hooks/useServers';
 import { useUsers } from './hooks/useUsers';
 
+// Random one-off password for approved requests that arrive without one (replaces the old shared default).
+const generateTempPassword = () => {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+  const bytes = new Uint32Array(14);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => chars[b % chars.length]).join('') + '#1';
+};
+
 export default function App() {
   const [isPublicPortal, setIsPublicPortal] = useState(() => {
     const p = (window.location.pathname || '').toLowerCase();
@@ -420,8 +428,10 @@ export default function App() {
   // Server Actions
   const handleAddServer = async (newServer) => {
     try {
-      await addServer(newServer);
-    } catch (e) {}
+      return await addServer(newServer);
+    } catch (e) {
+      return null;
+    }
   };
 
   const handleEditServer = async (updatedServer) => {
@@ -1201,7 +1211,7 @@ export default function App() {
             drive: requestObj.drive,
             clientType: requestObj.clientType || 'Shared',
             username: requestObj.username,
-            password: requestObj.password || 'Pass#123',
+            password: requestObj.password || generateTempPassword(),
             company: requestObj.company,
             billDate: new Date().toISOString().split('T')[0],
             expiryDate: requestObj.expiryDate,

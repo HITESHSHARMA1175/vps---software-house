@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { User, Key, ArrowRight, ShieldAlert, ShieldCheck, Activity, Cpu } from 'lucide-react';
+import { Eye, EyeOff, User, Key, ArrowRight, ShieldAlert, ShieldCheck, Activity, Cpu } from 'lucide-react';
 import ForgotPasswordModal from './ForgotPasswordModal';
 
 export default function LoginScreen({ onLoginSuccess, onOpenCustomerPortal, onBackToLanding }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [errorMsg, setErrorMsg] = useState(null);
   const [showForgotModal, setShowForgotModal] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -454,23 +455,50 @@ export default function LoginScreen({ onLoginSuccess, onOpenCustomerPortal, onBa
                         Forgot Password?
                       </button>
                     </div>
-                    <input
-                      type="password"
-                      className="form-input"
-                      required
-                      placeholder="Enter your Password"
-                      value={password}
-                      onChange={e => setPassword(e.target.value)}
-                      style={{
-                        backgroundColor: '#111827',
-                        borderColor: 'rgba(255, 255, 255, 0.1)',
-                        color: '#ffffff',
-                        padding: '0.75rem 1rem',
-                        fontSize: '0.9rem',
-                        borderRadius: '10px',
-                        transition: 'all 0.2s ease'
-                      }}
-                    />
+                    <div style={{ position: 'relative' }}>
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        className="form-input"
+                        required
+                        placeholder="Enter your Password"
+                        value={password}
+                        onChange={e => setPassword(e.target.value)}
+                        style={{
+                          backgroundColor: '#111827',
+                          borderColor: 'rgba(255, 255, 255, 0.1)',
+                          color: '#ffffff',
+                          padding: '0.75rem 2.75rem 0.75rem 1rem',
+                          fontSize: '0.9rem',
+                          borderRadius: '10px',
+                          transition: 'all 0.2s ease'
+                        }}
+                      />
+                      <button
+                        type="button"
+                        aria-label={showPassword ? 'Hide password' : 'Show password'}
+                        aria-pressed={showPassword}
+                        onClick={() => setShowPassword(v => !v)}
+                        onFocus={e => { e.currentTarget.style.boxShadow = '0 0 0 2px #38bdf8'; }}
+                        onBlur={e => { e.currentTarget.style.boxShadow = 'none'; }}
+                        style={{
+                          position: 'absolute',
+                          right: '0.5rem',
+                          top: '50%',
+                          transform: 'translateY(-50%)',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          padding: '6px',
+                          background: 'none',
+                          border: 'none',
+                          borderRadius: '6px',
+                          color: '#64748b',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                      </button>
+                    </div>
                   </div>
 
                   {errorMsg && (

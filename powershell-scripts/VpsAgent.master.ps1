@@ -78,6 +78,7 @@ $GuardianTaskName    = "InnovationVpsAgentGuardian"
 $AgentInstallDir     = "$env:ProgramData\InnovationWebWorks\VpsAgent"
 $InstalledScriptPath = "$AgentInstallDir\VpsAgent.ps1"
 $ConfigFile          = "$AgentInstallDir\agent-config.json"
+$AgentVersion        = "2.1.0"   # first version that understands SET_AGENT_KEY
 $LogFilePath         = "$AgentInstallDir\agent.log"
 $QueueFilePath       = "$AgentInstallDir\VpsAgentQueue.json"
 $StateFilePath       = "$AgentInstallDir\VpsAgentState.json"
@@ -119,6 +120,122 @@ function Write-AgentLog {
         }
         [System.IO.File]::AppendAllText($LogFilePath, "$logLine`r`n", [System.Text.Encoding]::UTF8)
     } catch {}
+}
+
+# -------------------------------------------------------------------------
+# Agent_Key support (Req 5): X-Agent-Key header on every Agent_Endpoint call
+# -------------------------------------------------------------------------
+function Get-AgentKey {
+    # Reads agentKey from agent-config.json on every call. Returns $null if missing/empty/unreadable.
+    try {
+        if (-not (Test-Path $ConfigFile)) { return $null }
+        $conf = Get-Content $ConfigFile -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($conf -and $conf.agentKey) {
+            $k = ([string]$conf.agentKey).Trim()
+            if ($k) { return $k }
+        }
+    } catch {}
+    return $null
+}
+
+function Get-AgentEndpointName {
+    # Endpoint path only (no host, no query string) so no secrets reach the log.
+    param ($Uri)
+    try {
+        $u = [System.Uri]"$Uri"
+        if ($u.IsAbsoluteUri) { return $u.AbsolutePath }
+    } catch {}
+    return ("$Uri" -split '\?')[0]
+}
+
+function Write-AgentKeyMissing {
+    param ($Uri)
+    Write-AgentLog "Request skipped: Agent_Key missing, empty, or unreadable in agent-config.json (endpoint: $(Get-AgentEndpointName $Uri))" "ERROR" "Red"
+}
+
+function Write-AgentUnauthorized {
+    param ($Uri)
+    Write-AgentLog "HTTP 401 Unauthorized from endpoint $(Get-AgentEndpointName $Uri) at $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss')). Will retry on next interval." "ERROR" "Red"
+}
+
+# Shadows the Invoke-RestMethod cmdlet for this script so every call adds X-Agent-Key.
+function Invoke-RestMethod {
+    [CmdletBinding()]
+    param (
+        [Parameter(Position = 0)] [string]$Uri,
+        [string]$Method,
+        $Headers,
+        $Body,
+        [string]$ContentType,
+        [int]$TimeoutSec
+    )
+    $agentKey = Get-AgentKey
+    if (-not $agentKey) {
+        Write-AgentKeyMissing $Uri
+        if ($ErrorActionPreference -eq 'Stop') { throw "Agent_Key missing; request to $(Get-AgentEndpointName $Uri) skipped." }
+        return $null
+    }
+    $h = @{}
+    if ($Headers) { foreach ($hk in $Headers.Keys) { $h[$hk] = $Headers[$hk] } }
+    $h["X-Agent-Key"] = $agentKey
+    $PSBoundParameters["Headers"] = $h
+    try {
+        Microsoft.PowerShell.Utility\Invoke-RestMethod @PSBoundParameters
+    } catch {
+        $code = $null
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        if ($code -eq 401) { Write-AgentUnauthorized $Uri }
+        throw
+    }
+}
+
+# Hardening (16.6): allowlist for account names before they reach any native command line.
+function Test-SafeAccountName ([string]$Name) {
+    if ([string]::IsNullOrEmpty($Name)) { return $false }
+    return ($Name -match '^[A-Za-z0-9._-]{1,64}$')
+}
+
+# Hardening (16.6): set (or create) a local account password without ever placing the
+# password on a command line. Cmdlets with SecureString first, ADSI SetPassword as fallback.
+function Set-LocalAccountPassword {
+    param (
+        [string]$Name,
+        [string]$Password,
+        [string]$Comment = "",
+        [switch]$Create
+    )
+    if (-not (Test-SafeAccountName $Name)) { return $false }
+    if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
+        try {
+            $secPass = ConvertTo-SecureString $Password -AsPlainText -Force
+            $existing = Get-LocalUser -Name $Name -ErrorAction SilentlyContinue
+            if ($existing) {
+                Set-LocalUser -Name $Name -Password $secPass -ErrorAction Stop
+                return $true
+            } elseif ($Create) {
+                New-LocalUser -Name $Name -Password $secPass -Description $Comment -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop | Out-Null
+                return $true
+            }
+        } catch {}
+    }
+    try {
+        $comp = $env:COMPUTERNAME
+        $u = $null
+        try { $u = [ADSI]"WinNT://$comp/$Name,user"; if (-not $u.Name) { $u = $null } } catch { $u = $null }
+        if (-not $u -and $Create) {
+            $u = ([ADSI]"WinNT://$comp").Create("User", $Name)
+            $u.SetPassword($Password)
+            if ($Comment) { $u.Description = $Comment }
+            $u.SetInfo()
+            return $true
+        }
+        if ($u) {
+            $u.SetPassword($Password)
+            $u.SetInfo()
+            return $true
+        }
+    } catch {}
+    return $false
 }
 
 function Test-IsAdmin {
@@ -296,8 +413,17 @@ function Install-VpsServiceTask {
 
         # 7. Install 24/7 Auto-Recovery Watchdog Guardian (Checks every 3 min; resurrects worker if killed or stopped)
         try {
-            $guardianCmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"`$p = Get-CimInstance Win32_Process -Filter `"CommandLine LIKE '`%VpsAgent`%' AND CommandLine LIKE '`%RunWorker`%'`" -ErrorAction SilentlyContinue; if (-not `$p) { & schtasks.exe /run /tn `"$TaskName`" 2>`$null }`""
-            & schtasks.exe /create /tn $GuardianTaskName /tr "$guardianCmd" /sc MINUTE /mo 3 /ru "NT AUTHORITY\SYSTEM" /rl HIGHEST /f 2>$null | Out-Null
+            # The guardian logic lives in a script file so no command string is built by concatenation.
+            $guardianScriptPath = "$AgentInstallDir\VpsAgentGuardian.ps1"
+            $guardianTaskLiteral = $TaskName -replace "'", "''"
+            $guardianLines = @(
+                '$p = Get-CimInstance Win32_Process -Filter "CommandLine LIKE ''%VpsAgent%'' AND CommandLine LIKE ''%RunWorker%''" -ErrorAction SilentlyContinue',
+                "if (-not `$p) { & schtasks.exe /run /tn '$guardianTaskLiteral' 2>`$null }"
+            )
+            Set-Content -Path $guardianScriptPath -Value $guardianLines -Encoding UTF8 -Force
+            & icacls.exe $guardianScriptPath '/inheritance:r' '/grant:r' 'SYSTEM:(F)' 'Administrators:(F)' '/Q' 2>$null | Out-Null
+            $guardianCmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $guardianScriptPath + '"'
+            & schtasks.exe /create /tn $GuardianTaskName /tr $guardianCmd /sc MINUTE /mo 3 /ru "NT AUTHORITY\SYSTEM" /rl HIGHEST /f 2>$null | Out-Null
             Write-Host " [+] Configured 24/7 Auto-Recovery Watchdog Guardian ($GuardianTaskName, runs every 3 min)" -ForegroundColor Green
         } catch {}
 
@@ -739,10 +865,16 @@ function Lock-TallyIniPermissions ([string]$iniPath, [string]$uName) {
         }
         
         Set-Acl -Path $iniPath -AclObject $acl
-        & icacls "$iniPath" /grant "superclient:(F)" "$($uName):(M)" /Q 2>$null
+        if (Test-SafeAccountName $uName) {
+            $userGrantM = $uName + ':(M)'
+            & icacls.exe $iniPath '/grant' 'superclient:(F)' $userGrantM '/Q' 2>$null
+        }
         Write-AgentLog "Configured tally.ini permissions: Administrators/superclient=Full, $uName=Modify" "SUCCESS" "Green"
     } catch {
-        & icacls "$iniPath" /inheritance:r /grant:r "Administrators:(F)" "SYSTEM:(F)" "superclient:(F)" "$($uName):(M)" /Q 2>$null
+        if (Test-SafeAccountName $uName) {
+            $userGrantM = $uName + ':(M)'
+            & icacls.exe $iniPath '/inheritance:r' '/grant:r' 'Administrators:(F)' 'SYSTEM:(F)' 'superclient:(F)' $userGrantM '/Q' 2>$null
+        }
     }
 }
 
@@ -1148,6 +1280,47 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
     }
 
     # -------------------------------------------------------------
+    # ACTION 0.05: SET_AGENT_KEY (Install per-server Agent_Key; key is never logged or echoed)
+    # -------------------------------------------------------------
+    if ($action -eq "SET_AGENT_KEY") {
+        $keyStatus = "FAILED"
+        $keyMessage = "SET_AGENT_KEY failed; old key kept."
+        $tmpConfig = "$ConfigFile.tmp"
+        try {
+            $newKey = if ($job.agentKey) { ([string]$job.agentKey).Trim() } else { "" }
+            if ($newKey -cnotmatch '^ak_[A-Za-z0-9_-]{43}$') {
+                $keyMessage = "Invalid agent key format; key not installed."
+            } else {
+                if (-not (Test-Path $AgentInstallDir)) { New-Item -ItemType Directory -Path $AgentInstallDir -Force | Out-Null }
+                $conf = @{}
+                if (Test-Path $ConfigFile) {
+                    $existing = Get-Content $ConfigFile -Raw -ErrorAction Stop | ConvertFrom-Json
+                    if ($existing) { foreach ($p in $existing.PSObject.Properties) { $conf[$p.Name] = $p.Value } }
+                }
+                $conf["agentKey"] = $newKey
+                $conf | ConvertTo-Json -Depth 3 | Out-File -FilePath $tmpConfig -Encoding utf8 -Force -ErrorAction Stop
+                & icacls.exe $tmpConfig '/inheritance:r' '/grant:r' 'SYSTEM:(F)' 'Administrators:(F)' '/Q' 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "icacls failed" }
+                Move-Item -Path $tmpConfig -Destination $ConfigFile -Force -ErrorAction Stop
+                $keyStatus = "COMPLETED"
+                $keyMessage = "Agent key installed"
+            }
+        } catch {
+            $keyMessage = "Failed to write agent-config.json; old key kept."
+        } finally {
+            if (Test-Path $tmpConfig) { Remove-Item $tmpConfig -Force -ErrorAction SilentlyContinue }
+            $newKey = $null
+        }
+        if ($keyStatus -eq "COMPLETED") { Write-AgentLog "Agent key installed via SET_AGENT_KEY." "SUCCESS" "Green" }
+        else { Write-AgentLog "SET_AGENT_KEY failed: $keyMessage" "ERROR" "Red" }
+        try {
+            $resBody = @{ serverId = $ServerId; jobId = $jobId; status = $keyStatus; message = $keyMessage } | ConvertTo-Json
+            Invoke-RestMethod -Uri $jobResultUrl -Method Post -Headers @{ "Content-Type" = "application/json" } -Body $resBody -TimeoutSec 10 -ErrorAction SilentlyContinue | Out-Null
+        } catch {}
+        return
+    }
+
+    # -------------------------------------------------------------
     # ACTION 0.1: GET_AGENT_LOG (Remote Diagnostic Log Retrieval)
     # -------------------------------------------------------------
     if ($action -eq "GET_AGENT_LOG") {
@@ -1208,18 +1381,8 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                 }
             }
 
-            # Method 3: net.exe user fallback
-            if (-not $changed) {
-                try {
-                    & net.exe user "$cleanUser" "$newPass" 2>$null
-                    if ($LASTEXITCODE -eq 0) {
-                        $changed = $true
-                        Write-AgentLog "Password changed successfully via net.exe for '$cleanUser'." "SUCCESS" "Green"
-                    }
-                } catch {
-                    $lastErr = $_.Exception.Message
-                }
-            }
+            # Method 3 (net.exe user <name> <password>) removed: the password would be re-parsed
+            # by native argument quoting. Methods 1 and 2 cover every supported Windows version.
 
             if (-not $changed) {
                 throw "Failed to update Windows password for '$cleanUser'. Details: $lastErr. (Ensure password satisfies Windows Server complexity requirements: minimum 6-8 chars with uppercase, lowercase, numbers or symbols)."
@@ -1269,7 +1432,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                     $userEntry.AccountDisabled = $true
                     $userEntry.SetInfo()
                 } catch {}
-                & net.exe user "$cleanUser" /active:no 2>$null
+                if (Test-SafeAccountName $cleanUser) { & net.exe user $cleanUser '/active:no' 2>$null }
                 Write-AgentLog "User account '$cleanUser' DISABLED on Windows VPS." "SUCCESS" "Green"
                 $msg = "Account '$cleanUser' successfully disabled on Windows VPS."
             } else {
@@ -1280,7 +1443,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                     $userEntry.AccountDisabled = $false
                     $userEntry.SetInfo()
                 } catch {}
-                & net.exe user "$cleanUser" /active:yes 2>$null
+                if (Test-SafeAccountName $cleanUser) { & net.exe user $cleanUser '/active:yes' 2>$null }
                 Write-AgentLog "User account '$cleanUser' ENABLED on Windows VPS." "SUCCESS" "Green"
                 $msg = "Account '$cleanUser' successfully enabled on Windows VPS."
             }
@@ -1702,6 +1865,10 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
         # 1. Clean Drive Letter and Folder Name
         $driveLetter = $rawDrive.Replace("Drive", "").Trim().TrimEnd('\')
         if (-not $driveLetter.EndsWith(':')) { $driveLetter = "$driveLetter`:" }
+
+        # Hardening (16.6): re-validate values before they reach any native command line
+        if (-not (Test-SafeAccountName $uName)) { throw "Invalid username." }
+        if ($driveLetter -notmatch '^[A-Za-z]:$') { throw "Invalid drive." }
         
         $sanitizedFolder = $compName.Trim() -replace '\s+', '_'
         $sanitizedFolder = $sanitizedFolder -replace '[\\/:*?"<>|]', ''
@@ -1729,7 +1896,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
             }
         }
 
-        # 3. Create / Update Windows Local User (Universal: Cmdlet -> ADSI -> net.exe)
+        # 3. Create / Update Windows Local User (Universal: Cmdlet with SecureString -> ADSI)
         $userConfigured = $false
         if (Get-Command Get-LocalUser -ErrorAction SilentlyContinue) {
             try {
@@ -1738,7 +1905,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                 if ($existingUser) {
                     Set-LocalUser -Name $uName -Password $secPass -Description "Tally Client - $compName" -PasswordNeverExpires $true -ErrorAction Stop
                 } else {
-                    New-LocalUser -Name $uName -Password $secPass -FullName $compName -Description "Tally Client - $compName" -PasswordNeverExpires $true -ErrorAction Stop | Out-Null
+                    New-LocalUser -Name $uName -Password $secPass -FullName $compName -Description "Tally Client - $compName" -PasswordNeverExpires -ErrorAction Stop | Out-Null
                 }
                 $userConfigured = $true
             } catch {}
@@ -1763,10 +1930,8 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                 }
                 $userConfigured = $true
             } catch {
-                & net.exe user "$uName" "$pass" /add /comment:"Tally Client - $compName" /expires:never /y 2>$null
-                if ($LASTEXITCODE -ne 0) {
-                    & net.exe user "$uName" "$pass" /y 2>$null
-                }
+                # net.exe user <name> <password> removed (password must never go on a command line).
+                Write-AgentLog "ADSI user create/update failed for '$uName': $($_.Exception.Message)" "WARN" "Yellow"
             }
         }
 
@@ -1787,10 +1952,10 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
             if (Get-Command Add-LocalGroupMember -ErrorAction SilentlyContinue) {
                 Add-LocalGroupMember -Group "Remote Desktop Users" -Member $uName -ErrorAction SilentlyContinue
             } else {
-                & net.exe localgroup "Remote Desktop Users" "$uName" /add 2>$null
+                if (Test-SafeAccountName $uName) { & net.exe localgroup 'Remote Desktop Users' $uName '/add' 2>$null }
             }
         } catch {
-            & net.exe localgroup "Remote Desktop Users" "$uName" /add 2>$null
+            if (Test-SafeAccountName $uName) { & net.exe localgroup 'Remote Desktop Users' $uName '/add' 2>$null }
         }
 
         # 4. Zero-Trust NTFS Security Isolation on the Entire Drive Root
@@ -1801,9 +1966,10 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                 
                 # 1. Native icacls enforcement on Entire Drive Root:
                 # Strip inheritance and purge all default shared groups (Users, Everyone, Authenticated Users)
-                & icacls.exe "$driveRoot" /inheritance:r 2>$null | Out-Null
-                & icacls.exe "$driveRoot" /remove:g "Users" "Everyone" "Authenticated Users" 2>$null | Out-Null
-                & icacls.exe "$driveRoot" /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "$uName`:(OI)(CI)F" "superclient:(OI)(CI)F" 2>$null | Out-Null
+                $userGrantF = $uName + ':(OI)(CI)F'
+                & icacls.exe $driveRoot '/inheritance:r' 2>$null | Out-Null
+                & icacls.exe $driveRoot '/remove:g' 'Users' 'Everyone' 'Authenticated Users' 2>$null | Out-Null
+                & icacls.exe $driveRoot '/grant:r' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' $userGrantF 'superclient:(OI)(CI)F' 2>$null | Out-Null
                 
                 # 2. .NET AccessControl API enforcement on Entire Drive Root
                 $driveAcl = Get-Acl -Path $driveRoot -ErrorAction SilentlyContinue
@@ -1826,7 +1992,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
 
                 # Ensure companyRoot inherits from the drive root seamlessly
                 try {
-                    & icacls.exe "$companyRoot" /inheritance:e 2>$null | Out-Null
+                    & icacls.exe $companyRoot '/inheritance:e' 2>$null | Out-Null
                 } catch {}
 
                 Write-AgentLog "Full Drive-Level NTFS Isolation successfully applied on $driveRoot for '$uName'." "SUCCESS" "Green"
@@ -1837,9 +2003,10 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
             # Safety Fallback: System Drive C: cannot have entire root locked out; isolate company directory
             try {
                 Write-AgentLog "System Drive C: detected. Applying Directory-Level Zero-Trust NTFS Isolation on $companyRoot for '$uName'..." "WARN" "Yellow"
-                & icacls.exe "$companyRoot" /inheritance:r 2>$null | Out-Null
-                & icacls.exe "$companyRoot" /remove:g "Users" "Everyone" "Authenticated Users" 2>$null | Out-Null
-                & icacls.exe "$companyRoot" /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "$uName`:(OI)(CI)F" "superclient:(OI)(CI)F" 2>$null | Out-Null
+                $userGrantF = $uName + ':(OI)(CI)F'
+                & icacls.exe $companyRoot '/inheritance:r' 2>$null | Out-Null
+                & icacls.exe $companyRoot '/remove:g' 'Users' 'Everyone' 'Authenticated Users' 2>$null | Out-Null
+                & icacls.exe $companyRoot '/grant:r' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' $userGrantF 'superclient:(OI)(CI)F' 2>$null | Out-Null
 
                 $acl = New-Object System.Security.AccessControl.DirectorySecurity
                 $acl.SetAccessRuleProtection($true, $false)
@@ -1929,7 +2096,7 @@ function Invoke-VpsJobExecution ($job, $jobResultUrl) {
                 $setupFile = Get-ChildItem -Path $cand -Filter "*.exe" -File -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "(setup|installer|tallyprime|tally)" } | Select-Object -First 1
                 if ($setupFile) {
                     try {
-                        Start-Process -FilePath $setupFile.FullName -ArgumentList "/silent /installpath=`"$tallyDir`"" -Wait -PassThru -NoNewWindow
+                        Start-Process -FilePath $setupFile.FullName -ArgumentList @('/silent', ('/installpath="' + $tallyDir + '"')) -Wait -PassThru -NoNewWindow
                         if (Test-Path "$tallyDir\tally.exe") {
                             $tallyInstalled = $true
                             break
@@ -2177,9 +2344,11 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
         }
 
         try {
-            & icacls.exe "$reqLetter`:\" /inheritance:r 2>$null | Out-Null
-            & icacls.exe "$reqLetter`:\" /remove:g "Users" "Everyone" "Authenticated Users" /q 2>$null | Out-Null
-            & icacls.exe "$reqLetter`:\" /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "superclient:(OI)(CI)F" /q 2>$null | Out-Null
+            if ($reqLetter -notmatch '^[A-Za-z]$') { throw "Invalid drive letter." }
+            $reqRoot = $reqLetter + ':\'
+            & icacls.exe $reqRoot '/inheritance:r' 2>$null | Out-Null
+            & icacls.exe $reqRoot '/remove:g' 'Users' 'Everyone' 'Authenticated Users' '/q' 2>$null | Out-Null
+            & icacls.exe $reqRoot '/grant:r' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' 'superclient:(OI)(CI)F' '/q' 2>$null | Out-Null
             $msg = "Zero-Trust NTFS security isolation enforced on Drive $reqLetter`:. Broad groups (Users/Everyone) stripped from root."
             Write-AgentLog $msg "SUCCESS" "Green"
             $resBody = @{
@@ -2234,7 +2403,7 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
         # 2. Disable user
         try {
             Disable-LocalUser -Name $username -ErrorAction SilentlyContinue | Out-Null
-            & net user "$username" /active:no 2>$null | Out-Null
+            if (Test-SafeAccountName $username) { & net.exe user $username '/active:no' 2>$null | Out-Null }
         } catch {}
 
         # 3. Locate client folder
@@ -2312,7 +2481,10 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 
         $uploadStart = Get-Date
         try {
+            $agentKey = Get-AgentKey
+            if (-not $agentKey) { Write-AgentKeyMissing $uploadFullUrl; throw "Agent_Key missing; upload skipped." }
             $req = [System.Net.HttpWebRequest]::Create($uploadFullUrl)
+            $req.Headers.Add("X-Agent-Key", $agentKey)
             $req.Method        = "POST"
             $req.ContentType   = "application/octet-stream"
             $req.ContentLength = $fileLength
@@ -2348,6 +2520,7 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
             $avgSpeed = [Math]::Round($fileLength / $elTotal / 1MB, 2)
             Write-AgentLog "Upload complete in $([Math]::Round($elTotal))s @ avg ${avgSpeed} MB/s" "SUCCESS" "Green"
         } catch {
+            try { if ([int]$_.Exception.Response.StatusCode -eq 401) { Write-AgentUnauthorized $uploadFullUrl } } catch {}
             throw "Upload failed: $($_.Exception.Message)"
         }
 
@@ -2410,7 +2583,10 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
 
         $dlStart = Get-Date
         try {
+            $agentKey = Get-AgentKey
+            if (-not $agentKey) { Write-AgentKeyMissing $dUrl; throw "Agent_Key missing; download skipped." }
             $dlReq = [System.Net.HttpWebRequest]::Create($dUrl)
+            $dlReq.Headers.Add("X-Agent-Key", $agentKey)
             $dlReq.Method           = "GET"
             $dlReq.Timeout          = -1
             $dlReq.ReadWriteTimeout = 7200000   # 2 hours
@@ -2439,6 +2615,7 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
             $avgSpd  = [Math]::Round($received / $elTotal / 1MB, 2)
             Write-AgentLog "Download complete: $([math]::Round($received/1MB,1)) MB in $([Math]::Round($elTotal))s @ avg ${avgSpd} MB/s" "SUCCESS" "Green"
         } catch {
+            try { if ([int]$_.Exception.Response.StatusCode -eq 401) { Write-AgentUnauthorized $dUrl } } catch {}
             throw "Download failed: $($_.Exception.Message)"
         }
 
@@ -2469,15 +2646,19 @@ Date: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
         }
 
         # User creation & Zero-Trust
-        & net user "$username" "$password" /add /comment:"Tally Client - $company" /expires:never /y 2>$null | Out-Null
-        & net user "$username" "$password" /y 2>$null | Out-Null
-        & net localgroup "Remote Desktop Users" "$username" /add 2>$null | Out-Null
+        if (-not (Test-SafeAccountName $username)) { throw "Invalid username for migration." }
+        if (-not (Set-LocalAccountPassword -Name $username -Password $password -Comment "Tally Client - $company" -Create)) {
+            throw "Failed to create or update Windows account '$username'."
+        }
+        & net.exe localgroup 'Remote Desktop Users' $username '/add' 2>$null | Out-Null
 
         # Permissions
         try {
-            & icacls.exe "$driveLetter`:\" /grant "$username`:(NP)(RX)" /q 2>$null | Out-Null
-            & icacls.exe "$targetDir" /inheritance:r 2>$null | Out-Null
-            & icacls.exe "$targetDir" /grant "Administrators:(OI)(CI)F" "SYSTEM:(OI)(CI)F" "superclient:(OI)(CI)F" "$username`:(OI)(CI)F" /q 2>$null | Out-Null
+            $userGrantRx = $username + ':(NP)(RX)'
+            $userGrantF  = $username + ':(OI)(CI)F'
+            & icacls.exe ($driveLetter + ':\') '/grant' $userGrantRx '/q' 2>$null | Out-Null
+            & icacls.exe $targetDir '/inheritance:r' 2>$null | Out-Null
+            & icacls.exe $targetDir '/grant' 'Administrators:(OI)(CI)F' 'SYSTEM:(OI)(CI)F' 'superclient:(OI)(CI)F' $userGrantF '/q' 2>$null | Out-Null
         } catch {}
 
         if (Test-Path $tempZip) { Remove-Item $tempZip -Force -ErrorAction SilentlyContinue }
@@ -2787,6 +2968,7 @@ function Run-AgentWorker {
             $payload = @{
                 serverId = $ServerId
                 serverToken = $ServerToken
+                agentVersion = $AgentVersion
                 cpuUsage = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
                 ram = $ram
                 disks = $disks
@@ -2861,7 +3043,11 @@ function Run-AgentWorker {
             try {
                 $listenResponse = Invoke-RestMethod -Uri $listenUrl -Method Get -Headers $listenHeaders -TimeoutSec 30 -ErrorAction Stop
             } catch {
-                # In case of temporary network glitch or proxy timeout, continue
+                # In case of temporary network glitch or proxy timeout, continue.
+                # Missing key or 401 returns immediately, so wait one interval to avoid a tight retry loop.
+                if (-not (Get-AgentKey) -or "$($_.Exception.Message)" -match '401') {
+                    Start-Sleep -Seconds ([Math]::Max(1, $IntervalSeconds))
+                }
             }
 
             # If jobs were dispatched instantly via the push pipe

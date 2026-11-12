@@ -12,6 +12,7 @@ import {
   Layers,
   Radio
 } from 'lucide-react';
+import AgentKeyPanel from './AgentKeyPanel';
 
 export function generateDriveRange(startChar = 'E', endChar = 'P', prefix = 'Drive ') {
   const startCode = (startChar || 'A').toUpperCase().charCodeAt(0);
@@ -32,6 +33,9 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
   const [createdServer, setCreatedServer] = useState(null);
   const [commandTab, setCommandTab] = useState('POWERSHELL');
   const [copied, setCopied] = useState(false);
+  const [agentKeyInfo, setAgentKeyInfo] = useState(null); // { agentKey, installerUrl } shown once
+  const [installCommand, setInstallCommand] = useState('');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const [driveMode, setDriveMode] = useState('RANGE'); // 'RANGE' or 'CUSTOM'
   const [startLetter, setStartLetter] = useState('E');
@@ -41,6 +45,8 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
   useEffect(() => {
     if (!isOpen) {
       setCreatedServer(null);
+      setAgentKeyInfo(null);
+      setInstallCommand('');
       setCopied(false);
     } else {
       const handleKeyDown = (e) => {
@@ -94,7 +100,7 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
       httpUrl: `http://${rawIp}:8080`,
       httpsUrl: `https://${rawIp}:443`,
       superClientUser: formData.superClientUser,
-      superClientPass: formData.superClientPass || 'Pass#123',
+      superClientPass: formData.superClientPass || '',
       totalUsersLimit: parseInt(formData.totalUsersLimit) || (formData.serverType === 'Dedicated Server' ? 5 : 30),
       specs: formData.specs,
       portSerial: '443',
@@ -102,8 +108,17 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
       availableDrives
     };
 
-    onAddServer(newServer);
-    setCreatedServer(newServer);
+    setIsSubmitting(true);
+    Promise.resolve(onAddServer(newServer))
+      .then((result) => {
+        if (!result || result.success === false) return; // creation failed; the caller already showed an error
+        setAgentKeyInfo(result.agentKey
+          ? { agentKey: result.agentKey, installerUrl: result.agentInstall?.installerUrl || '' }
+          : null);
+        setInstallCommand(result.agentInstall?.powershellCommand || '');
+        setCreatedServer(newServer);
+      })
+      .finally(() => setIsSubmitting(false));
   };
 
   const portalBaseUrl = typeof window !== 'undefined' && window.location.origin.includes('localhost')
@@ -113,7 +128,7 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
   if (createdServer) {
     const srvTarget = createdServer.ipPort || createdServer.id;
     const encSrv = encodeURIComponent(srvTarget);
-    const psCmd = `[Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192; (New-Object Net.WebClient).DownloadString('${portalBaseUrl}/install.ps1?s=${encSrv}') | iex`;
+    const psCmd = installCommand || `[Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192; (New-Object Net.WebClient).DownloadString('${portalBaseUrl}/install.ps1?s=${encSrv}') | iex`;
     
     const handleCopyCreated = (cmd) => {
       navigator.clipboard.writeText(cmd);
@@ -153,6 +168,16 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
               </div>
               <span className="badge badge-emerald" style={{ fontSize: '0.75rem' }}>Node Registered</span>
             </div>
+
+            {agentKeyInfo && (
+              <div style={{ marginBottom: '1rem' }}>
+                <AgentKeyPanel
+                  agentKey={agentKeyInfo.agentKey}
+                  installerUrl={agentKeyInfo.installerUrl}
+                  onClose={() => { setAgentKeyInfo(null); setInstallCommand(''); }}
+                />
+              </div>
+            )}
 
             <p style={{ fontSize: '0.82rem', color: '#cbd5e1', marginBottom: '10px', lineHeight: '1.4' }}>
               Copy this 1-click command and run it <strong>once</strong> on your Windows VPS as Administrator.
@@ -221,6 +246,8 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
               className="btn btn-primary"
               onClick={() => {
                 setCreatedServer(null);
+                setAgentKeyInfo(null);
+                setInstallCommand('');
                 onClose();
               }}
             >
@@ -424,7 +451,7 @@ export default function AddServerModal({ isOpen, onClose, onAddServer }) {
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
             <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-            <button type="submit" className="btn btn-primary">Add Server Node</button>
+            <button type="submit" className="btn btn-primary" disabled={isSubmitting}>{isSubmitting ? 'Adding...' : 'Add Server Node'}</button>
           </div>
         </form>
       </div>

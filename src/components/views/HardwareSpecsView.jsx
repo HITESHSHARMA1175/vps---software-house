@@ -28,6 +28,7 @@ import {
   Calendar,
   Sparkles
 } from 'lucide-react';
+import { useAuth } from '../../contexts/AuthContext';
 import AgentInstallModal from '../AgentInstallModal';
 import { exportHardwareHistoryExcel } from '../../utils/exportUtils';
 
@@ -106,6 +107,8 @@ export default function HardwareSpecsView({
   onDirectRemoteConnect,
   onNavigateToVps
 }) {
+  const { currentUser } = useAuth();
+  const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
   const [search, setSearch] = useState('');
   const [selectedServerId, setSelectedServerId] = useState(initialServerId || 'ALL');
   const [activeTab, setActiveTab] = useState('PROFILES'); // 'PROFILES' | 'TABLE' | 'HISTORY'
@@ -758,11 +761,14 @@ export default function HardwareSpecsView({
                           serverId: server.id,
                           company: server.name,
                           username: server.superClientUser || 'Superclient',
-                          password: server.superClientPass || 'Pass#123',
+                          password: '', // never sent to the browser; SUPER_ADMIN reveals it on demand via the backend
+                          isServerAccount: true,
                           drive: 'Master Node',
                           expiryDate: '2099-12-31'
                         }, 'SUPERCLIENT')}
                         className="btn btn-warning btn-xs"
+                        disabled={!isSuperAdmin}
+                        title={isSuperAdmin ? undefined : 'Super Admin only'}
                         style={{ fontSize: '11px', padding: '4px 8px' }}
                       >
                         <Shield size={11} fill="#ffffff" /> Superclient

@@ -11,6 +11,26 @@ import { fileURLToPath } from 'url';
 import nodemailer from 'nodemailer';
 import Redis from 'ioredis';
 import { EventEmitter } from 'events';
+import { loadConfig, ConfigError, buildPortalUrl, isOriginAllowed } from './lib/config.js';
+import { deriveClientIp, parseTrustedProxies } from './lib/clientIp.js';
+import { createAgentAuthMiddleware, findServerForKeyCheck, hashAgentKey, generateAgentKey, rotateAgentKey, RotationError } from './lib/agentAuth.js';
+import { needsAgentUpdate, isJobDeliverable, scrubJobSecrets } from './lib/agentKeyDelivery.js';
+import { evaluateReadiness } from './lib/agentKeyReadiness.js';
+import { generatePassword } from './lib/passwords.js';
+import { sealPassword, openPassword, isCiphertext } from './lib/secretCipher.js';
+import { openTotpSecret, sealTotpSecret, hashBackupCodes, consumeBackupCode } from './lib/totpSecrets.js';
+import { validateJobParams, validateJobRequest, JobParamError } from './lib/jobParams.js';
+import { toPublicClient, toPublicServer, toPublicJob, toPublicMigration, toPublicEmployee } from './lib/publicProjections.js';
+import { createMysqlEntityStore, importLegacyEntities, deleteServerWithTombstones, restoreServer, tombstoneTerms } from './lib/entityStore.js';
+import { finishJob, sweepTerminalJobs, TERMINAL_STATUSES } from './lib/provisionJobs.js';
+import { createDiskPersistence } from './lib/diskPersistence.js';
+import { pickMeta, applyMeta, metaChanged } from './lib/serverMeta.js';
+import { safeWrite } from './lib/dbWrite.js';
+import { translateText } from './lib/translate.js';
+import { applyRateLimit, rateLimitKey as buildRateLimitKey } from './lib/rateLimit.js';
+import { sessionCookieOptions, sessionClearOptions } from './lib/sessionCookie.js';
+import { createHealthHandler } from './lib/health.js';
+import { AsyncLocalStorage } from 'async_hooks';
 
 // Real-Time 0-Second Job Dispatcher (Option B: Instant Push Long-Polling)
 const agentJobEmitter = new EventEmitter();
@@ -21,7 +41,44 @@ const liveScreenStore = new Map(); // key: `${serverId}_${sessionId}` -> { scree
 const liveScreenWaiters = new EventEmitter();
 liveScreenWaiters.setMaxListeners(200);
 
-dotenv.config();
+if (process.env.TEST_MODE !== '1') dotenv.config();
+
+// Validated configuration (production-hardening). Exits before listening on any problem.
+let config;
+try {
+  config = loadConfig(process.env);
+} catch (err) {
+  if (err instanceof ConfigError) {
+    console.error('[Config] Invalid configuration, refusing to start:');
+    for (const problem of err.problems) console.error(`[Config]  - ${problem}`);
+    process.exit(1);
+  }
+  throw err;
+}
+
+// Managed_Password sealing (Requirement 7). Stored copies (MySQL, memoryStore, database.json) are `enc:v1:` ciphertext.
+// sealPw is idempotent for values that are already ciphertext (UI forms echo stored values back unchanged).
+const MASKED_SECRET = 'â€¢â€¢â€¢â€¢â€¢â€¢â€¢â€¢';
+function sealPw(plain) {
+  if (plain === '' || plain === null || plain === undefined) return '';
+  if (isCiphertext(plain)) return String(plain);
+  return sealPassword(String(plain), config.encryptionKey);
+}
+// Throws PasswordUnreadableError (message carries no password data) if a stored value cannot be decrypted.
+class PasswordUnreadableError extends Error {
+  constructor() { super('Password cannot be decrypted'); this.name = 'PasswordUnreadableError'; }
+}
+function openPw(stored) {
+  try {
+    return openPassword(stored, config.encryptionKey);
+  } catch {
+    throw new PasswordUnreadableError();
+  }
+}
+
+console.log(`[Config] Agent_Auth_Mode: ${config.agentAuthMode}`);
+for (const note of config.notes) console.log(`[Config] ${note}`);
+for (const warning of config.warnings) console.warn(`[Config] ${warning}`);
 
 // Redis Connection & Client Layer (Sub-millisecond In-Memory Caching with Graceful Fallback)
 const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
@@ -33,6 +90,8 @@ let redisClient = null;
 let isRedisConnected = false;
 
 try {
+  // TEST_MODE: no Redis connection (its retry loop would keep the process alive); in-memory fallback is used.
+  if (process.env.TEST_MODE === '1') throw new Error('disabled in TEST_MODE');
   const redisOptions = REDIS_URL ? REDIS_URL : {
     host: REDIS_HOST,
     port: REDIS_PORT,
@@ -46,7 +105,7 @@ try {
   redisClient = new Redis(redisOptions);
 
   redisClient.on('connect', () => {
-    console.log(`⚡ Redis Connected successfully (${REDIS_HOST}:${REDIS_PORT})`);
+    console.log(`âš¡ Redis Connected successfully (${REDIS_HOST}:${REDIS_PORT})`);
     isRedisConnected = true;
   });
 
@@ -56,7 +115,7 @@ try {
 
   redisClient.on('error', (err) => {
     if (isRedisConnected) {
-      console.warn("⚠️ Redis Notice:", err.message);
+      console.warn("âš ï¸ Redis Notice:", err.message);
     }
     isRedisConnected = false;
   });
@@ -66,10 +125,10 @@ try {
   });
 
   redisClient.connect().catch((err) => {
-    console.log("ℹ️ Redis background connection notice:", err.message, "(Fallback to in-memory/MySQL active)");
+    console.log("â„¹ï¸ Redis background connection notice:", err.message, "(Fallback to in-memory/MySQL active)");
   });
 } catch (e) {
-  console.warn("ℹ️ Redis fallback active:", e.message);
+  console.warn("â„¹ï¸ Redis fallback active:", e.message);
   redisClient = null;
   isRedisConnected = false;
 }
@@ -126,7 +185,7 @@ function getISTTimeString(d = new Date()) {
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DB_FILE_PATH = path.join(__dirname, 'database.json');
+const DB_FILE_PATH = process.env.DB_FILE_PATH || path.join(__dirname, 'database.json');
 const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const VOICE_NOTES_DIR = path.join(UPLOADS_DIR, 'voice-notes');
 const MIGRATIONS_DIR = path.join(UPLOADS_DIR, 'migrations');
@@ -135,10 +194,19 @@ if (!fs.existsSync(VOICE_NOTES_DIR)) fs.mkdirSync(VOICE_NOTES_DIR, { recursive: 
 if (!fs.existsSync(MIGRATIONS_DIR)) fs.mkdirSync(MIGRATIONS_DIR, { recursive: true });
 
 const app = express();
-const PORT = process.env.PORT || 5000;
 
 // Trust proxy for secure cookies and accurate IP behind reverse proxy / cPanel Apache
-app.set('trust proxy', 1);
+// Only addresses in config.trustedProxies (TRUSTED_PROXIES, default loopback) may supply forwarded headers.
+const trustedProxyMatcher = parseTrustedProxies(config.trustedProxies);
+app.set('trust proxy', (addr) => trustedProxyMatcher.check(addr));
+app.use((req, res, next) => {
+  req.clientIp = deriveClientIp({
+    socketAddress: req.socket?.remoteAddress,
+    headers: req.headers,
+    trusted: trustedProxyMatcher,
+  });
+  next();
+});
 
 // Production Security Headers Middleware
 app.use((req, res, next) => {
@@ -154,25 +222,38 @@ app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (e.g. mobile apps, curl, native agent, same-origin)
     if (!origin) return callback(null, true);
-    try {
-      const url = new URL(origin);
-      if (
-        url.hostname === 'localhost' ||
-        url.hostname === '127.0.0.1' ||
-        url.hostname === 'vps.innovationwebworks.in' ||
-        url.hostname.endsWith('.innovationwebworks.in')
-      ) {
-        return callback(null, true);
-      }
-    } catch (e) {}
+    if (isOriginAllowed(config, origin)) return callback(null, true);
     callback(new Error('Cross-Origin Request Blocked by Security Policy'));
   },
   credentials: true
 }));
 
+// Req 22: unauthenticated health check, registered before any auth middleware or /api guard.
+app.get('/health', createHealthHandler({ getDb: () => (isMysqlConnected && dbPool ? dbPool : null) }));
+
 app.use(express.json({ limit: '25mb' }));
 app.use(cookieParser());
-app.use('/uploads', express.static(UPLOADS_DIR));
+
+// Maps a JobParamError raised inside queueServerJob to HTTP 400 for whichever route triggered it.
+// The route's own catch may still answer 500 with err.message; this wrapper downgrades that to the
+// generic 400 (statusCode 400 on JobParamError) so nothing about the rejected input is echoed.
+const jobParamContext = new AsyncLocalStorage();
+app.use((req, res, next) => {
+  const store = { rejected: false };
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    if (store.rejected && res.statusCode >= 400) {
+      res.statusCode = 400;
+      return origJson({ success: false, error: 'Invalid request parameters' });
+    }
+    return origJson(body);
+  };
+  jobParamContext.run(store, next);
+});
+// Task 31.1: only voice notes are served, and only to authenticated staff sessions (cookie-based, so <audio src> works).
+// Everything else under /uploads (notably uploads/migrations) is never served; files on disk are untouched.
+app.use('/uploads/voice-notes', requireAuth, express.static(VOICE_NOTES_DIR, { index: false, dotfiles: 'deny' }));
+app.use('/uploads', (req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 
 
 
@@ -198,8 +279,29 @@ function saveVoiceNoteAudio(base64Data, ticketId) {
 const rateLimitStores = {
   login: new Map(),        // key: `${ip}:${identifier}` -> { count, firstAttempt }
   otpRequest: new Map(),   // key: `${ip}:${identifier}` -> { count, firstAttempt }
-  otpVerify: new Map()     // key: identifier -> { count, firstAttempt }
+  otpVerify: new Map(),    // key: identifier -> { count, firstAttempt }
+  // Public endpoint limiter types (task 29.5); keys come from buildRateLimitKey(name, ip, identifier)
+  requestDemo: new Map(),
+  verifyCustomer: new Map(),
+  verifyCustomerIdentifier: new Map(),
+  publicTickets: new Map(),
+  resetPassword: new Map(),
+  resetPasswordUser: new Map(),
+  otpVerifyUser: new Map(),
+  validateLogin: new Map(),
+  validateLoginIp: new Map(),
+  agentAuthFail: new Map()
 };
+const PUBLIC_RATE_LIMIT_STORE_TYPES = ['agentAuthFail', 'requestDemo', 'verifyCustomer', 'verifyCustomerIdentifier', 'publicTickets', 'resetPassword', 'resetPasswordUser', 'otpVerifyUser', 'validateLogin', 'validateLoginIp'];
+
+// Applies a configured public limit (config.rateLimits[name]); resolves false after writing a 429.
+function applyPublicLimit(res, type, name, key) {
+  const lim = config.rateLimits[name];
+  return applyRateLimit(res, type, key, lim.max, lim.windowSec * 1000, {
+    checkRateLimit,
+    isProduction: config.isProduction
+  });
+}
 
 // Cleanup stale rate limit records every 10 minutes
 setInterval(() => {
@@ -213,7 +315,13 @@ setInterval(() => {
   for (const [key, val] of rateLimitStores.otpVerify.entries()) {
     if (now - val.firstAttempt > 15 * 60 * 1000) rateLimitStores.otpVerify.delete(key);
   }
-}, 10 * 60 * 1000);
+  // Public limiter stores: drop records older than the longest default window (1 hour)
+  for (const type of PUBLIC_RATE_LIMIT_STORE_TYPES) {
+    for (const [key, val] of rateLimitStores[type].entries()) {
+      if (now - val.firstAttempt > 60 * 60 * 1000) rateLimitStores[type].delete(key);
+    }
+  }
+}, 10 * 60 * 1000).unref?.();
 
 async function checkRateLimit(type, key, maxAttempts = 5, windowMs = 15 * 60 * 1000) {
   // 1. Try Redis Distributed Rate Limiter
@@ -273,18 +381,72 @@ const dbConfig = {
 let dbPool = null;
 let isMysqlConnected = false;
 
+// Req 11: production without ALLOW_JSON_FALLBACK=1 must not silently fall back to database.json.
+const strictMysql = config.isProduction && !config.allowJsonFallback;
+const STARTUP_DB_DEADLINE_MS = 30000;
+
+export class DbUnavailableError extends Error {
+  constructor(cause) {
+    super('Database unavailable');
+    this.name = 'DbUnavailableError';
+    this.code = 'DB_UNAVAILABLE';
+    this.causeCode = cause && cause.code;
+  }
+}
+const DB_CONNECTION_ERROR_CODES = new Set([
+  'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE', 'EHOSTUNREACH', 'ENOENT',
+  'PROTOCOL_CONNECTION_LOST', 'PROTOCOL_SEQUENCE_TIMEOUT', 'ER_CON_COUNT_ERROR', 'ER_SERVER_SHUTDOWN'
+]);
+function isDbConnectionError(err) {
+  return !!err && (err.fatal === true || DB_CONNECTION_ERROR_CODES.has(err.code));
+}
+// Wraps pool.query/execute so connection-level failures surface as DbUnavailableError (strict mode only).
+function wrapDbPool(pool) {
+  if (!strictMysql || !pool || pool.__dbWrapped) return pool;
+  for (const method of ['query', 'execute']) {
+    const original = pool[method].bind(pool);
+    pool[method] = async (...args) => {
+      try {
+        return await original(...args);
+      } catch (err) {
+        if (isDbConnectionError(err)) throw new DbUnavailableError(err);
+        throw err;
+      }
+    };
+  }
+  pool.__dbWrapped = true;
+  return pool;
+}
+// Entity_Tables creation status (Req 10.1-10.3); dependent features must check this before using the tables.
+let entityTablesReady = false;
+const entityTableFailures = [];
+
+// Dependencies for lib/provisionJobs.js (db only when MySQL is connected).
+function provisionJobDeps() {
+  return {
+    dbPool: isMysqlConnected && dbPool ? dbPool : null,
+    getJobs: () => memoryStore.provisionJobs || []
+  };
+}
+
+// Default seeding. Production: admin is seeded only when SUPERADMIN_DEFAULT_PASS is set; employee/sales demo users are never seeded.
+const seedAdminPass = process.env.SUPERADMIN_DEFAULT_PASS || '';
+if (config.isProduction && seedAdminPass === '') {
+  console.error('[Seed] SUPERADMIN_DEFAULT_PASS is not set in production: default admin user will not be seeded.');
+}
 const defaultPortalUsers = [
-  {
+  ...((!config.isProduction || seedAdminPass !== '') ? [{
     id: 'puser-1',
     name: 'Master Admin (HOD)',
     username: 'admin',
-    password: bcrypt.hashSync(process.env.SUPERADMIN_DEFAULT_PASS || 'Admin@12345', 10),
+    password: bcrypt.hashSync(seedAdminPass || 'Admin@12345', 10),
     role: 'SUPER_ADMIN',
     status: 'ACTIVE',
     email: 'mannk4811@gmail.com',
     createdAt: '2026-08-15 10:00:00',
     lastLogin: '2026-08-18 22:00:00'
-  },
+  }] : []),
+  ...(config.isProduction ? [] : [
   {
     id: 'puser-2',
     name: 'Staff Employee',
@@ -307,7 +469,22 @@ const defaultPortalUsers = [
     createdAt: '2026-08-15 10:00:00',
     lastLogin: '2026-08-18 19:30:00'
   }
+  ])
 ];
+
+// Startup audit (production): warn once per portal user whose hash matches a known default password. Logs username only.
+function auditDefaultPortalPasswords() {
+  if (!config.isProduction) return;
+  const knownDefaults = ['emp123', 'sales123', 'Admin@12345'];
+  for (const u of (memoryStore?.portalUsers || [])) {
+    if (!u || typeof u.password !== 'string' || !u.password.startsWith('$2')) continue;
+    try {
+      if (knownDefaults.some(p => bcrypt.compareSync(p, u.password))) {
+        console.warn(`[Security] Portal user "${u.username}" uses a known default password. Change it.`);
+      }
+    } catch { /* malformed hash: skip */ }
+  }
+}
 
 const defaultAuditLogs = [
   {
@@ -321,100 +498,73 @@ const defaultAuditLogs = [
   }
 ];
 
-// 1. Local File Disk Persistence Layer (Fail-Safe Storage)
-function loadDiskDatabase() {
-  try {
-    if (fs.existsSync(DB_FILE_PATH)) {
-      const data = fs.readFileSync(DB_FILE_PATH, 'utf8');
-      const parsed = JSON.parse(data);
-      const rawUsers = Array.isArray(parsed.users) ? parsed.users : [];
-      const cleanUsers = rawUsers.filter(u => 
-        u.username &&
-        typeof u.username === 'string' &&
-        !u.username.includes(' ') &&
-        /^[a-zA-Z0-9_\-\.\$]+$/.test(u.username.trim()) &&
-        !['newds', 'kkjhjmhgvhb', 'juist chill', 'mann', 'administrator', 'guest', 'defaultaccount', 'wdagutilityaccount'].includes(u.username.toLowerCase().trim()) &&
-        !['mann pvt ltd', 'mann gupta', 'cheetah', 'sadsadaedsd'].includes(u.company?.toLowerCase()?.trim())
-      );
-      const rawReqs = Array.isArray(parsed.requests) ? parsed.requests : [];
-      const cleanReqs = rawReqs.filter(r => 
-        !['newds', 'kkjhjmhgvhb', 'juist chill', 'mann'].includes(r.username?.toLowerCase())
-      );
+// 1. Local File Disk Persistence Layer (Fail-Safe Storage), guarded by lib/diskPersistence.js (design 20.1).
+// Disabled in production unless ALLOW_JSON_FALLBACK=1; logs its ENABLED/DISABLED line once at creation.
+const diskStore = createDiskPersistence({
+  config,
+  filePath: DB_FILE_PATH,
+  log: (m) => console.log(m),
+  defaults: { portalUsers: defaultPortalUsers, auditLogs: defaultAuditLogs }
+});
 
-      return {
-        servers: Array.isArray(parsed.servers) ? parsed.servers : [],
-        users: cleanUsers,
-        requests: cleanReqs,
-        renewals: Array.isArray(parsed.renewals) ? parsed.renewals : [],
-        tickets: Array.isArray(parsed.tickets) ? parsed.tickets : [],
-        portalUsers: Array.isArray(parsed.portalUsers) && parsed.portalUsers.length > 0 ? parsed.portalUsers : defaultPortalUsers,
-        auditLogs: Array.isArray(parsed.auditLogs) && parsed.auditLogs.length > 0 ? parsed.auditLogs : defaultAuditLogs,
-        sessions: Array.isArray(parsed.sessions) ? parsed.sessions : [],
-        inactivityTracker: Array.isArray(parsed.inactivityTracker) ? parsed.inactivityTracker : [],
-        sessionEvents: Array.isArray(parsed.sessionEvents) ? parsed.sessionEvents : [],
-        dailyUserActivity: Array.isArray(parsed.dailyUserActivity) ? parsed.dailyUserActivity : [],
-        monitoringAlerts: Array.isArray(parsed.monitoringAlerts) ? parsed.monitoringAlerts : [],
-        provisionJobs: Array.isArray(parsed.provisionJobs) ? parsed.provisionJobs : [],
-        duplicateLoginEvents: Array.isArray(parsed.duplicateLoginEvents) ? parsed.duplicateLoginEvents : [],
-        migrations: Array.isArray(parsed.migrations) ? parsed.migrations : [],
-        deletedServers: Array.isArray(parsed.deletedServers) ? parsed.deletedServers : [],
-        hardwareHistory: Array.isArray(parsed.hardwareHistory) ? parsed.hardwareHistory : []
-      };
-    }
-  } catch (e) {
-    console.error("Error reading database.json file:", e.message);
-  }
-  return {
-    servers: [],
-    users: [],
-    requests: [],
-    renewals: [],
-    tickets: [],
-    portalUsers: defaultPortalUsers,
-    auditLogs: defaultAuditLogs,
-    sessions: [],
-    inactivityTracker: [],
-    sessionEvents: [],
-    dailyUserActivity: [],
-    monitoringAlerts: [],
-    provisionJobs: [],
-    duplicateLoginEvents: [],
-    migrations: [],
-    deletedServers: [],
-    hardwareHistory: []
-  };
+function loadDiskDatabase() {
+  return diskStore.load();
 }
 
 function saveDiskDatabase(servers, users, requests, portalUsers, auditLogs, renewals, sessions, tickets) {
-  try {
-    const payload = {
-      updatedAt: new Date().toISOString(),
-      servers: servers || memoryStore.servers || [],
-      users: users || memoryStore.users || [],
-      requests: requests || memoryStore.requests || [],
-      renewals: renewals || memoryStore.renewals || [],
-      tickets: tickets || memoryStore.tickets || [],
-      portalUsers: portalUsers || memoryStore.portalUsers || defaultPortalUsers,
-      auditLogs: auditLogs || memoryStore.auditLogs || defaultAuditLogs,
-      sessions: sessions || memoryStore.sessions || [],
-      inactivityTracker: memoryStore.inactivityTracker || [],
-      sessionEvents: memoryStore.sessionEvents || [],
-      dailyUserActivity: memoryStore.dailyUserActivity || [],
-      monitoringAlerts: memoryStore.monitoringAlerts || [],
-      provisionJobs: memoryStore.provisionJobs || [],
-      duplicateLoginEvents: memoryStore.duplicateLoginEvents || [],
-      migrations: memoryStore.migrations || [],
-      deletedServers: memoryStore.deletedServers || [],
-      hardwareHistory: memoryStore.hardwareHistory || []
-    };
-    fs.writeFileSync(DB_FILE_PATH, JSON.stringify(payload, null, 2), 'utf8');
-  } catch (e) {
-    console.error("Error writing database.json file:", e.message);
-  }
+  if (!diskStore.enabled) return;
+  // diskStore.save() blanks agentKey/password/newPassword on a copy of each provision job.
+  diskStore.save({
+    updatedAt: new Date().toISOString(),
+    servers: servers || memoryStore.servers || [],
+    users: users || memoryStore.users || [],
+    requests: requests || memoryStore.requests || [],
+    renewals: renewals || memoryStore.renewals || [],
+    tickets: tickets || memoryStore.tickets || [],
+    portalUsers: portalUsers || memoryStore.portalUsers || defaultPortalUsers,
+    auditLogs: auditLogs || memoryStore.auditLogs || defaultAuditLogs,
+    sessions: sessions || memoryStore.sessions || [],
+    inactivityTracker: memoryStore.inactivityTracker || [],
+    sessionEvents: memoryStore.sessionEvents || [],
+    dailyUserActivity: memoryStore.dailyUserActivity || [],
+    monitoringAlerts: memoryStore.monitoringAlerts || [],
+    provisionJobs: memoryStore.provisionJobs || [],
+    duplicateLoginEvents: memoryStore.duplicateLoginEvents || [],
+    migrations: memoryStore.migrations || [],
+    deletedServers: memoryStore.deletedServers || [],
+    hardwareHistory: memoryStore.hardwareHistory || []
+  });
 }
-
 // Memory Cache
 let memoryStore = loadDiskDatabase();
+
+// vps_servers.meta persistence (lib/serverMeta.js): per-server last written hash / time / drift baseline key.
+const SERVER_META_MIN_INTERVAL_MS = 60 * 1000;
+const serverMetaState = new Map(); // serverId -> { hash, at, hwKey }
+function hardwareBaselineKey(meta) {
+  const hw = meta && meta.lastHardware;
+  if (!hw || typeof hw !== 'object') return '';
+  const { recordedAt, ...stable } = hw; // recordedAt moves on every telemetry; it is not a baseline change
+  return JSON.stringify(stable);
+}
+// Writes meta when it changed: at most once per 60s per server, except a changed lastHardware baseline (immediate).
+async function persistServerMeta(server) {
+  if (!server || !server.id || !isMysqlConnected || !dbPool) return;
+  const meta = pickMeta(server);
+  const state = serverMetaState.get(server.id) || { hash: undefined, at: 0, hwKey: '' };
+  const { changed, hash, json } = metaChanged(state.hash, meta);
+  if (!changed) return;
+  const hwKey = hardwareBaselineKey(meta);
+  const now = Date.now();
+  if (hwKey === state.hwKey && now - state.at < SERVER_META_MIN_INTERVAL_MS) return;
+  serverMetaState.set(server.id, { ...state, at: now }); // block concurrent duplicate writes
+  try {
+    await dbPool.query('UPDATE `vps_servers` SET `meta` = ? WHERE `id` = ?', [json, server.id]);
+    serverMetaState.set(server.id, { hash, at: now, hwKey });
+  } catch (err) {
+    console.error(`[ServerMeta] write failed for ${server.id}:`, err.code || err.message);
+  }
+}
 
 function getServerAliases(srvRef) {
   const set = new Set();
@@ -526,7 +676,7 @@ function sanitizeServerSpecs(specs) {
   }
   // Real processor metadata or agent bullet indicates authentic verified specs
   if (
-    lower.includes('•') ||
+    lower.includes('â€¢') ||
     lower.includes('intel') ||
     lower.includes('amd') ||
     lower.includes('xeon') ||
@@ -542,7 +692,7 @@ function sanitizeServerSpecs(specs) {
     lower === '8 core / 32gb ram' ||
     lower === '8 core / 32gb ram / 256 gb ssd' ||
     lower === '8 core / 32gb / 256 gb ssd' ||
-    (lower.startsWith('8 core') && lower.endsWith('32gb ram') && !lower.includes('•'))
+    (lower.startsWith('8 core') && lower.endsWith('32gb ram') && !lower.includes('â€¢'))
   ) {
     return null;
   }
@@ -554,7 +704,7 @@ async function initMySQLDatabase() {
   const dbUser = process.env.DB_USER || process.env.MYSQL_USER || 'root';
   const dbPass = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || '';
   const dbName = process.env.DB_NAME || process.env.MYSQL_DATABASE || 'vps_db';
-  const configsToTry = process.platform === 'win32'
+  const configsToTry = (process.platform === 'win32' || process.env.DB_SKIP_SOCKETS === '1')
     ? [{ host: process.env.DB_HOST || process.env.MYSQL_HOST || '127.0.0.1', user: dbUser, password: dbPass, database: dbName, port: parseInt(process.env.DB_PORT || '3306', 10) }]
     : [
         { socketPath: '/run/mysqld/mysqld.sock', user: dbUser, password: dbPass, database: dbName },
@@ -568,8 +718,9 @@ async function initMySQLDatabase() {
     try {
       dbPool = mysql.createPool({ ...cfg, waitForConnections: true, connectionLimit: 10, connectTimeout: 1000 });
       await dbPool.query('SELECT 1');
+      wrapDbPool(dbPool);
       isMysqlConnected = true;
-      console.log(`✅ Fully Functional MariaDB/MySQL Database Connected: innovati4_vps_db via ${cfg.socketPath ? 'Unix Socket (' + cfg.socketPath + ')' : 'TCP'}`);
+      console.log(`âœ… Fully Functional MariaDB/MySQL Database Connected: ${dbName} via ${cfg.socketPath ? 'Unix Socket (' + cfg.socketPath + ')' : 'TCP'}`);
       break;
     } catch (e) {
       dbPool = null;
@@ -577,7 +728,7 @@ async function initMySQLDatabase() {
   }
 
   if (!isMysqlConnected) {
-    console.warn("ℹ️ Operating on fail-safe disk database (database.json).");
+    console.warn("â„¹ï¸ Operating on fail-safe disk database (database.json).");
     return;
   }
 
@@ -593,7 +744,7 @@ async function initMySQLDatabase() {
         \`httpUrl\` VARCHAR(255) DEFAULT '',
         \`httpsUrl\` VARCHAR(255) DEFAULT '',
         \`superClientUser\` VARCHAR(100) DEFAULT 'Superclient',
-        \`superClientPass\` VARCHAR(100) DEFAULT '',
+        \`superClientPass\` VARCHAR(2048) DEFAULT '',
         \`totalUsersLimit\` INT DEFAULT 30,
         \`specs\` VARCHAR(255) DEFAULT '',
         \`portSerial\` VARCHAR(50) DEFAULT '',
@@ -622,6 +773,7 @@ async function initMySQLDatabase() {
         \`customerEmail\` VARCHAR(100) DEFAULT '',
         \`notes\` TEXT,
         \`status\` VARCHAR(50) DEFAULT 'ACTIVE',
+        \`tallyVersion\` VARCHAR(50) DEFAULT '',
         \`createdAt\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `);
@@ -667,8 +819,41 @@ async function initMySQLDatabase() {
       await dbPool.query(`ALTER TABLE \`client_subscriptions\` ADD COLUMN \`lastActiveAt\` VARCHAR(100) DEFAULT NULL`);
     } catch(e) {}
     try {
-      await dbPool.query(`ALTER TABLE \`client_subscriptions\` ADD COLUMN \`password\` VARCHAR(255) DEFAULT 'Pass#123' AFTER \`username\``);
+      // No schema default: a fresh column has no shared default password
+      await dbPool.query(`ALTER TABLE \`client_subscriptions\` ADD COLUMN \`password\` VARCHAR(2048) NOT NULL AFTER \`username\``);
     } catch(e) {}
+    // Widen password columns to VARCHAR(2048). Repeat-safe and non-destructive:
+    // each column keeps its existing nullability and default (DROP DEFAULT is a separate, user-approved step).
+    for (const [tbl, col] of [['client_subscriptions', 'password'], ['vps_servers', 'superClientPass'], ['vps_provision_jobs', 'password']]) {
+      try {
+        const [cols] = await dbPool.query(
+          'SELECT CHARACTER_MAXIMUM_LENGTH AS len, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS def FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+          [tbl, col]
+        );
+        if (!cols || !cols.length || Number(cols[0].len) >= 2048) continue;
+        const notNull = String(cols[0].nullable).toUpperCase() === 'NO';
+        const def = cols[0].def === null || cols[0].def === undefined
+          ? (notNull ? '' : ' DEFAULT NULL')
+          : ` DEFAULT ${dbPool.escape(String(cols[0].def))}`;
+        await dbPool.query(`ALTER TABLE \`${tbl}\` MODIFY COLUMN \`${col}\` VARCHAR(2048)${notNull ? ' NOT NULL' : ''}${def}`);
+      } catch(e) { console.error(`[DB] ${tbl}.${col} widen failed:`, e.code || e.message); }
+    }
+    // Widen TOTP secret columns to VARCHAR(512) for encrypted values. Repeat-safe, widening only,
+    // keeps existing nullability and default.
+    for (const col of ['two_factor_secret', 'two_factor_temp_secret']) {
+      try {
+        const [cols] = await dbPool.query(
+          'SELECT CHARACTER_MAXIMUM_LENGTH AS len, IS_NULLABLE AS nullable, COLUMN_DEFAULT AS def FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+          ['portal_users', col]
+        );
+        if (!cols || !cols.length || Number(cols[0].len) >= 512) continue;
+        const notNull = String(cols[0].nullable).toUpperCase() === 'NO';
+        const def = cols[0].def === null || cols[0].def === undefined
+          ? (notNull ? '' : ' DEFAULT NULL')
+          : ` DEFAULT ${dbPool.escape(String(cols[0].def))}`;
+        await dbPool.query(`ALTER TABLE \`portal_users\` MODIFY COLUMN \`${col}\` VARCHAR(512)${notNull ? ' NOT NULL' : ''}${def}`);
+      } catch(e) { console.error(`[DB] portal_users.${col} widen failed:`, e.code || e.message); }
+    }
 
     // 4. Audit Logs Table
     await dbPool.query(`
@@ -740,6 +925,7 @@ async function initMySQLDatabase() {
         \`resolutionNotes\` TEXT,
         \`voiceNoteUrl\` TEXT,
         \`createdBy\` VARCHAR(100) DEFAULT 'Staff',
+        \`source\` VARCHAR(30) DEFAULT '',
         \`resolvedAt\` VARCHAR(50) DEFAULT NULL,
         \`createdAt\` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
@@ -819,7 +1005,7 @@ async function initMySQLDatabase() {
         \`serverId\` VARCHAR(100) NOT NULL,
         \`companyName\` VARCHAR(255) NOT NULL,
         \`username\` VARCHAR(100) NOT NULL,
-        \`password\` VARCHAR(255) NOT NULL,
+        \`password\` VARCHAR(2048) NOT NULL,
         \`drive\` VARCHAR(50) NOT NULL,
         \`expiryDate\` VARCHAR(50) DEFAULT NULL,
         \`setupTSplus\` TINYINT DEFAULT 1,
@@ -900,9 +1086,35 @@ async function initMySQLDatabase() {
     try {
       await dbPool.query(`ALTER TABLE \`support_tickets\` ADD COLUMN \`voiceNoteUrl\` TEXT`);
     } catch(e) {}
+    // Task 25.8: repeat-safe nullable additions (duplicate-column error is expected on later starts). Reversible with DROP COLUMN.
+    try {
+      await dbPool.query(`ALTER TABLE \`support_tickets\` ADD COLUMN \`source\` VARCHAR(30) DEFAULT ''`);
+    } catch(e) {}
+    try {
+      await dbPool.query(`ALTER TABLE \`client_subscriptions\` ADD COLUMN \`tallyVersion\` VARCHAR(50) DEFAULT ''`);
+    } catch(e) {}
     try {
       await dbPool.query(`ALTER TABLE \`vps_servers\` ADD COLUMN \`apiKey\` VARCHAR(100) DEFAULT NULL`);
     } catch(e) {}
+    try {
+      // Widen for hashed/longer agent keys; repeat-safe, keeps existing values
+      await dbPool.query(`ALTER TABLE \`vps_servers\` MODIFY COLUMN \`apiKey\` VARCHAR(255) DEFAULT NULL`);
+    } catch(e) { console.error('[DB] apiKey widen failed:', e.code || e.message); }
+    // Agent key rotation grace window (Requirements 2.10-2.12): nullable, repeat-safe, no data dropped
+    for (const ddl of [
+      'ALTER TABLE `vps_servers` ADD COLUMN `previousApiKey` VARCHAR(255) DEFAULT NULL',
+      'ALTER TABLE `vps_servers` ADD COLUMN `previousKeyExpiresAt` BIGINT DEFAULT NULL'
+    ]) {
+      try { await dbPool.query(ddl); } catch (e) {
+        if (e.code !== 'ER_DUP_FIELDNAME') console.error('[DB] vps_servers grace column add failed:', e.code || e.message);
+      }
+    }
+    try {
+      // Runtime attributes JSON (lib/serverMeta.js); nullable, repeat-safe, existing rows stay NULL
+      await dbPool.query(`ALTER TABLE \`vps_servers\` ADD COLUMN \`meta\` LONGTEXT DEFAULT NULL`);
+    } catch(e) {
+      if (e.code !== 'ER_DUP_FIELDNAME') console.error('[DB] vps_servers.meta add failed:', e.code || e.message);
+    }
     try {
       await dbPool.query(`ALTER TABLE \`vps_provision_jobs\` ADD COLUMN \`action\` VARCHAR(50) DEFAULT 'PROVISION_TALLY_USER'`);
     } catch(e) {}
@@ -921,6 +1133,61 @@ async function initMySQLDatabase() {
     try {
       await dbPool.query(`ALTER TABLE \`server_telemetry\` ADD COLUMN \`disabledServerUsers\` LONGTEXT DEFAULT NULL`);
     } catch(e) {}
+
+    // 16. Entity_Tables (requests, renewals, migrations, deleted_servers). CREATE IF NOT EXISTS only; never drops or alters data.
+    // A failure is logged per table, other tables are untouched, and startup failure is recorded for dependent features.
+    entityTableFailures.length = 0;
+    const entityDocCols = `\`id\` VARCHAR(100) PRIMARY KEY, \`status\` VARCHAR(50), \`createdAt\` VARCHAR(50), \`data\` LONGTEXT NOT NULL, KEY \`idx_status\` (\`status\`)`;
+    const entityTableDdl = {
+      requests: entityDocCols,
+      renewals: entityDocCols,
+      migrations: entityDocCols,
+      deleted_servers: `\`token\` VARCHAR(255) PRIMARY KEY, \`serverId\` VARCHAR(100), \`deletedAt\` VARCHAR(50), \`snapshot\` LONGTEXT`
+    };
+    for (const [tableName, cols] of Object.entries(entityTableDdl)) {
+      try {
+        await dbPool.query(`CREATE TABLE IF NOT EXISTS \`${tableName}\` (${cols}) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+      } catch (e) {
+        entityTableFailures.push(tableName);
+        console.error(`[DB] STARTUP FAILURE: could not create entity table '${tableName}':`, e.code || e.message);
+      }
+    }
+    entityTablesReady = entityTableFailures.length === 0;
+    if (!entityTablesReady) {
+      console.error(`[DB] STARTUP FAILURE: entity tables unavailable (${entityTableFailures.join(', ')}); dependent features are disabled.`);
+    }
+
+    // 17. workspace_requests (public demo leads). CREATE IF NOT EXISTS only; legacy database.json leads are imported once into an empty table.
+    try {
+      await dbPool.query(`CREATE TABLE IF NOT EXISTS \`workspace_requests\` (\`id\` VARCHAR(100) PRIMARY KEY, \`createdAt\` VARCHAR(50), \`status\` VARCHAR(50), \`data\` LONGTEXT NOT NULL, KEY \`idx_status\` (\`status\`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`);
+      const [wrCount] = await dbPool.query(`SELECT COUNT(*) AS c FROM \`workspace_requests\``);
+      if (Number(wrCount && wrCount[0] && wrCount[0].c) === 0) {
+        let legacyLeads = Array.isArray(memoryStore.workspaceRequests) ? memoryStore.workspaceRequests : [];
+        if (legacyLeads.length === 0) {
+          try {
+            const legacy = fs.existsSync(DB_FILE_PATH) ? diskStore.readLegacyFile() : null;
+            if (legacy && Array.isArray(legacy.workspaceRequests)) legacyLeads = legacy.workspaceRequests;
+          } catch (e) { console.error('[Import] could not read database.json for workspace requests:', e && e.message); }
+        }
+        let imported = 0;
+        for (const l of legacyLeads) {
+          if (!l || typeof l.id !== 'string' || l.id === '') continue;
+          try {
+            await dbPool.query(`INSERT IGNORE INTO \`workspace_requests\` (\`id\`, \`createdAt\`, \`status\`, \`data\`) VALUES (?, ?, ?, ?)`, [l.id, String(l.createdAt || ''), String(l.status || 'NEW'), JSON.stringify(l)]);
+            imported++;
+          } catch (e) { console.error('[Import] workspace request insert failed:', e.code || e.message); }
+        }
+        if (imported > 0) console.log(`[Import] imported ${imported} workspace request(s) from legacy data`);
+      }
+      const [wrRows] = await dbPool.query(`SELECT \`data\` FROM \`workspace_requests\` ORDER BY \`createdAt\` DESC`);
+      const loadedLeads = [];
+      for (const r of wrRows || []) {
+        try { loadedLeads.push(JSON.parse(r.data)); } catch (e) { /* skip unparsable row */ }
+      }
+      memoryStore.workspaceRequests = loadedLeads;
+    } catch (e) {
+      console.error('[DB] workspace_requests setup failed:', e.code || e.message);
+    }
 
     // Fetch initial data from MySQL into memoryStore with strict deduplication by lowercased username
     const [usrRows] = await dbPool.query(`SELECT * FROM \`client_subscriptions\` ORDER BY \`createdAt\` DESC`);
@@ -950,11 +1217,19 @@ async function initMySQLDatabase() {
 
     const [srvRows] = await dbPool.query(`SELECT * FROM \`vps_servers\` ORDER BY \`createdAt\` ASC`);
     if (srvRows && srvRows.length > 0) {
-      memoryStore.servers = srvRows.map(r => ({
-        ...r,
-        specs: sanitizeServerSpecs(r.specs),
-        availableDrives: typeof r.availableDrives === 'string' ? JSON.parse(r.availableDrives) : r.availableDrives
-      }));
+      memoryStore.servers = srvRows.map(r => {
+        const { meta: rawMeta, ...row } = r;
+        const srv = {
+          ...row,
+          specs: sanitizeServerSpecs(r.specs),
+          availableDrives: typeof r.availableDrives === 'string' ? JSON.parse(r.availableDrives) : r.availableDrives
+        };
+        if (srv.previousKeyExpiresAt !== null && srv.previousKeyExpiresAt !== undefined) srv.previousKeyExpiresAt = Number(srv.previousKeyExpiresAt);
+        applyMeta(srv, rawMeta);
+        const baseline = metaChanged(undefined, pickMeta(srv));
+        serverMetaState.set(srv.id, { hash: baseline.hash, at: Date.now(), hwKey: hardwareBaselineKey(pickMeta(srv)) });
+        return srv;
+      });
     }
 
     // Load initial hardware history
@@ -1071,7 +1346,7 @@ async function initMySQLDatabase() {
         resultMessage: r.resultMessage || '',
         createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString()
       }));
-      console.log(`📋 Loaded ${memoryStore.provisionJobs.length} PENDING remote VPS provision/management job(s) from MySQL.`);
+      console.log(`ðŸ“‹ Loaded ${memoryStore.provisionJobs.length} PENDING remote VPS provision/management job(s) from MySQL.`);
     } else if (!memoryStore.provisionJobs) {
       memoryStore.provisionJobs = [];
     }
@@ -1079,7 +1354,7 @@ async function initMySQLDatabase() {
     try {
       const [dupRows] = await dbPool.query(`SELECT * FROM \`duplicate_login_events\` ORDER BY \`createdAt\` DESC LIMIT 1000`);
       memoryStore.duplicateLoginEvents = Array.isArray(dupRows) ? dupRows : [];
-      console.log(`🛡️ Loaded ${memoryStore.duplicateLoginEvents.length} duplicate login / auto-logoff event(s) from MySQL.`);
+      console.log(`ðŸ›¡ï¸ Loaded ${memoryStore.duplicateLoginEvents.length} duplicate login / auto-logoff event(s) from MySQL.`);
     } catch (e) {
       if (!memoryStore.duplicateLoginEvents) memoryStore.duplicateLoginEvents = [];
     }
@@ -1103,8 +1378,15 @@ function generateSessionToken() {
 const SESSION_INACTIVITY_MS = 30 * 60 * 1000;
 const SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
+let internalSecretDisabledLogged = false;
+
 async function validateSession(req) {
-  if (req.headers['x-internal-secret'] && req.headers['x-internal-secret'] === (process.env.INTERNAL_SECRET || 'vps-internal-automation-2026')) {
+  if (req.headers['x-internal-secret'] && config.internalSecret === null) {
+    if (!internalSecretDisabledLogged) {
+      internalSecretDisabledLogged = true;
+      console.warn('[Auth] INTERNAL_SECRET is not set: internal secret authentication path is disabled.');
+    }
+  } else if (req.headers['x-internal-secret'] && config.internalSecret !== null && req.headers['x-internal-secret'] === config.internalSecret) {
     return {
       sessionId: 'internal-automation',
       employeeId: 'emp-internal',
@@ -1264,11 +1546,11 @@ function logAudit(operator, role, action, target, details, ipAddress = '') {
   saveDiskDatabase();
 
   if (isMysqlConnected && dbPool) {
-    dbPool.query(
+    safeWrite('audit_logs', () => dbPool.query(
       `REPLACE INTO \`audit_logs\` (id, timestamp, operator, role, action, target, details, ipAddress)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
       [newLog.id, newLog.timestamp, newLog.operator, newLog.role, newLog.action, newLog.target, newLog.details, newLog.ipAddress]
-    ).catch(() => {});
+    ));
   }
 }
 
@@ -1462,7 +1744,7 @@ setInterval(() => {
   for (const [key, val] of preAuthStore.entries()) {
     if (val.expiresAt < now) preAuthStore.delete(key);
   }
-}, 5 * 60 * 1000);
+}, 5 * 60 * 1000).unref?.();
 
 // Helper to create and commit server session
 async function finalizeEmployeeLogin(matchedUser, tabId, clientIp, req, res) {
@@ -1518,19 +1800,13 @@ async function finalizeEmployeeLogin(matchedUser, tabId, clientIp, req, res) {
   const rateLimitKey = `${clientIp}:${matchedUser.username.toLowerCase()}`;
   resetRateLimit('login', rateLimitKey);
 
-  const isSecureConnection = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
-  res.cookie('vps_session_id', sessionToken, {
-    httpOnly: true,
-    secure: isSecureConnection,
-    sameSite: 'lax',
-    path: '/'
-  });
+  res.cookie('vps_session_id', sessionToken, sessionCookieOptions({ config, req, maxAgeMs: SESSION_MAX_AGE_MS }));
 
   logAudit(matchedUser.name, matchedUser.role, 'LOGIN', matchedUser.username, `Employee logged in successfully (Session ID: ${sessionId})`, clientIp);
 
   return res.json({
     success: true,
-    employee: {
+    employee: toPublicEmployee({
       id: matchedUser.id,
       name: matchedUser.name,
       username: matchedUser.username,
@@ -1538,12 +1814,13 @@ async function finalizeEmployeeLogin(matchedUser, tabId, clientIp, req, res) {
       role: matchedUser.role,
       status: matchedUser.status || 'ACTIVE',
       two_factor_enabled: Boolean(matchedUser.two_factor_enabled)
-    }
+    })
   });
 }
 
 // POST /api/public/request-demo (Public Workspace Deployment Lead Submission)
 app.post('/api/public/request-demo', async (req, res) => {
+  if (!(await applyPublicLimit(res, 'requestDemo', 'REQUEST_DEMO', buildRateLimitKey('REQUEST_DEMO', req.clientIp)))) return;
   try {
     const { companyName, contactName, phone, email, userCount, storageGB, notes } = req.body;
     if (!companyName || !phone) {
@@ -1565,6 +1842,13 @@ app.post('/api/public/request-demo', async (req, res) => {
 
     if (!memoryStore.workspaceRequests) memoryStore.workspaceRequests = [];
     memoryStore.workspaceRequests.unshift(lead);
+    if (isMysqlConnected && dbPool) {
+      try {
+        await dbPool.query(`INSERT INTO \`workspace_requests\` (\`id\`, \`createdAt\`, \`status\`, \`data\`) VALUES (?, ?, ?, ?)`, [lead.id, lead.createdAt, lead.status, JSON.stringify(lead)]);
+      } catch (e) {
+        console.error('[LEAD] workspace_requests insert failed:', e.code || e.message);
+      }
+    }
     saveDiskDatabase();
 
     // Log in audit log
@@ -1574,10 +1858,10 @@ app.post('/api/public/request-demo', async (req, res) => {
       'PUBLIC_WORKSPACE_REQUEST',
       lead.companyName,
       `New workspace deployment requested by ${lead.contactName || lead.companyName} (${lead.phone}, ${lead.userCount} users, ${lead.storageGB} GB NVMe)`,
-      req.ip || ''
+      req.clientIp || ''
     );
 
-    console.log(`📋 [LEAD] New workspace deployment requested: ${lead.companyName} | ${lead.phone} | Users: ${lead.userCount}`);
+    console.log(`ðŸ“‹ [LEAD] New workspace deployment requested: ${lead.companyName} | ${lead.phone} | Users: ${lead.userCount}`);
     res.json({ success: true, message: 'Deployment request logged successfully.', leadId: lead.id });
   } catch (err) {
     console.error('Error handling workspace deployment request:', err.message);
@@ -1598,7 +1882,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
   }
 
-  const clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0].trim() || req.headers['x-real-ip'] || req.ip || '127.0.0.1';
+  const clientIp = req.clientIp;
   const rateLimitKey = `${clientIp}:${userIdentifier}`;
 
   // Find user in MySQL or memory
@@ -1648,7 +1932,7 @@ app.post('/api/auth/login', async (req, res) => {
         const newHash = bcrypt.hashSync(rawPassword, 10);
         matchedUser.password = newHash;
         if (isMysqlConnected && dbPool) {
-          dbPool.query(`UPDATE \`portal_users\` SET password = ? WHERE id = ?`, [newHash, matchedUser.id]).catch(() => {});
+          safeWrite('portal_users', () => dbPool.query(`UPDATE \`portal_users\` SET password = ? WHERE id = ?`, [newHash, matchedUser.id]));
         }
       }
     }
@@ -1702,13 +1986,20 @@ app.post('/api/auth/2fa/validate-login', async (req, res) => {
     return res.status(400).json({ success: false, message: 'Authentication token and verification code are required.' });
   }
 
+  // Rate limits: per client IP, then per preAuthToken (exceeding the token limit forces a new sign-in)
+  if (!(await applyPublicLimit(res, 'validateLoginIp', 'VALIDATE_LOGIN_IP', buildRateLimitKey('VALIDATE_LOGIN_IP', req.clientIp)))) return;
+  if (!(await applyPublicLimit(res, 'validateLogin', 'VALIDATE_LOGIN', buildRateLimitKey('VALIDATE_LOGIN', '-', String(preAuthToken))))) {
+    preAuthStore.delete(preAuthToken);
+    return;
+  }
+
   const preAuth = preAuthStore.get(preAuthToken);
   if (!preAuth || Date.now() > preAuth.expiresAt) {
     if (preAuth) preAuthStore.delete(preAuthToken);
     return res.status(401).json({ success: false, message: '2FA session expired. Please sign in again with your password.' });
   }
 
-  const clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0].trim() || req.headers['x-real-ip'] || req.ip || '127.0.0.1';
+  const clientIp = req.clientIp;
 
   let matchedUser = null;
   if (isMysqlConnected && dbPool) {
@@ -1726,28 +2017,32 @@ app.post('/api/auth/2fa/validate-login', async (req, res) => {
   }
 
   const cleanCode = String(code).trim().replace(/\s+/g, '');
-  const isTotp = verifyTotp(matchedUser.two_factor_secret, cleanCode);
+  // Open the stored seed (legacy plaintext passes through). A decrypt failure is answered exactly
+  // like a wrong code and only the user id is logged (never the stored value).
+  let totpSecretPlain;
+  try {
+    totpSecretPlain = openTotpSecret(matchedUser.two_factor_secret, config.encryptionKey);
+  } catch {
+    console.error(`[2FA] Stored TOTP secret could not be decrypted for user id ${matchedUser.id}`);
+    return res.status(401).json({ success: false, message: 'Invalid 6-digit Authenticator code or recovery code. Please try again.' });
+  }
+  const isTotp = verifyTotp(totpSecretPlain, cleanCode);
 
   let isBackupMatch = false;
   if (!isTotp && matchedUser.two_factor_backup_codes) {
-    let backupList = [];
-    try {
-      backupList = typeof matchedUser.two_factor_backup_codes === 'string'
-        ? JSON.parse(matchedUser.two_factor_backup_codes)
-        : matchedUser.two_factor_backup_codes;
-    } catch(e) {}
-
-    const cleanInputBackup = cleanCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
-    const foundIdx = backupList.findIndex(bc => bc.toUpperCase().replace(/[^A-Z0-9]/g, '') === cleanInputBackup);
-    if (foundIdx !== -1) {
+    // Dual-form compare: bcrypt hashes ($2...) and legacy plaintext entries; a used code is removed.
+    const { matched, remaining } = consumeBackupCode(matchedUser.two_factor_backup_codes, cleanCode);
+    if (matched) {
       isBackupMatch = true;
-      backupList.splice(foundIdx, 1);
-      const updatedJson = JSON.stringify(backupList);
+      const updatedJson = JSON.stringify(remaining);
       matchedUser.two_factor_backup_codes = updatedJson;
+      const memUser = (memoryStore.portalUsers || []).find(u => u.id === matchedUser.id);
+      if (memUser && memUser !== matchedUser) memUser.two_factor_backup_codes = updatedJson;
       if (isMysqlConnected && dbPool) {
-        dbPool.query(`UPDATE \`portal_users\` SET two_factor_backup_codes = ? WHERE id = ?`, [updatedJson, matchedUser.id]).catch(() => {});
+        safeWrite('portal_users', () => dbPool.query(`UPDATE \`portal_users\` SET two_factor_backup_codes = ? WHERE id = ?`, [updatedJson, matchedUser.id]));
       }
-      logAudit(matchedUser.name, matchedUser.role, '2FA_BACKUP_CODE_USED', matchedUser.username, `Used emergency recovery code. ${backupList.length} remaining`, clientIp);
+      saveDiskDatabase();
+      logAudit(matchedUser.name, matchedUser.role, '2FA_BACKUP_CODE_USED', matchedUser.username, `Used emergency recovery code. ${remaining.length} remaining`, clientIp);
     }
   }
 
@@ -1773,16 +2068,20 @@ app.post('/api/auth/2fa/setup', requireAuth, async (req, res) => {
     const issuer = 'Innovation VPS Portal';
     const otpauthUrl = `otpauth://totp/${encodeURIComponent(issuer)}:${encodeURIComponent(username)}?secret=${secret}&issuer=${encodeURIComponent(issuer)}&algorithm=SHA1&digits=6&period=30`;
 
+    // Store the temp secret sealed and backup codes as bcrypt hashes; plaintext is returned once below.
+    const sealedTempSecret = sealTotpSecret(secret, config.encryptionKey);
+    const hashedCodesJson = JSON.stringify(hashBackupCodes(backupCodes));
+
     if (isMysqlConnected && dbPool) {
       await dbPool.query(
         `UPDATE \`portal_users\` SET two_factor_temp_secret = ?, two_factor_backup_codes = ? WHERE id = ?`,
-        [secret, JSON.stringify(backupCodes), userId]
+        [sealedTempSecret, hashedCodesJson, userId]
       );
     }
     const memUser = (memoryStore.portalUsers || []).find(u => u.id === userId);
     if (memUser) {
-      memUser.two_factor_temp_secret = secret;
-      memUser.two_factor_backup_codes = JSON.stringify(backupCodes);
+      memUser.two_factor_temp_secret = sealedTempSecret;
+      memUser.two_factor_backup_codes = hashedCodesJson;
     }
 
     res.json({
@@ -1817,12 +2116,20 @@ app.post('/api/auth/2fa/confirm-setup', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, message: 'No pending 2FA setup found. Please generate a new QR code.' });
     }
 
-    const isValid = verifyTotp(user.two_factor_temp_secret, code);
+    let tempSecretPlain;
+    try {
+      tempSecretPlain = openTotpSecret(user.two_factor_temp_secret, config.encryptionKey);
+    } catch {
+      console.error(`[2FA] Pending TOTP secret could not be decrypted for user id ${userId}`);
+      return res.status(400).json({ success: false, message: 'No pending 2FA setup found. Please generate a new QR code.' });
+    }
+
+    const isValid = verifyTotp(tempSecretPlain, code);
     if (!isValid) {
       return res.status(400).json({ success: false, message: 'Invalid 6-digit code. Please check your Google Authenticator app.' });
     }
 
-    const confirmedSecret = user.two_factor_temp_secret;
+    const confirmedSecret = sealTotpSecret(tempSecretPlain, config.encryptionKey);
     if (isMysqlConnected && dbPool) {
       await dbPool.query(
         `UPDATE \`portal_users\` SET two_factor_enabled = 1, two_factor_secret = ?, two_factor_temp_secret = NULL WHERE id = ?`,
@@ -1836,7 +2143,7 @@ app.post('/api/auth/2fa/confirm-setup', requireAuth, async (req, res) => {
     }
     saveDiskDatabase();
 
-    logAudit(req.employee.name, req.employee.role, '2FA_ENABLED', req.employee.username, 'Google Authenticator 2FA activated successfully', req.ip);
+    logAudit(req.employee.name, req.employee.role, '2FA_ENABLED', req.employee.username, 'Google Authenticator 2FA activated successfully', req.clientIp);
 
     res.json({
       success: true,
@@ -1889,7 +2196,7 @@ app.post('/api/auth/2fa/disable', requireAuth, async (req, res) => {
     user.two_factor_backup_codes = null;
     saveDiskDatabase();
 
-    logAudit(req.employee.name, req.employee.role, '2FA_DISABLED', req.employee.username, 'Google Authenticator 2FA disabled by user', req.ip);
+    logAudit(req.employee.name, req.employee.role, '2FA_DISABLED', req.employee.username, 'Google Authenticator 2FA disabled by user', req.clientIp);
 
     res.json({
       success: true,
@@ -1921,7 +2228,7 @@ app.post('/api/employees/:id/reset-2fa', requireAdmin, async (req, res) => {
     }
     saveDiskDatabase();
 
-    logAudit(req.employee.name, req.employee.role, 'ADMIN_RESET_2FA', target?.username || targetUserId, `Super Admin reset 2FA for employee ${target?.username || targetUserId}`, req.ip);
+    logAudit(req.employee.name, req.employee.role, 'ADMIN_RESET_2FA', target?.username || targetUserId, `Super Admin reset 2FA for employee ${target?.username || targetUserId}`, req.clientIp);
 
     res.json({ success: true, message: `2FA reset successfully for ${target?.username || 'user'}.` });
   } catch (err) {
@@ -1938,16 +2245,10 @@ app.post('/api/auth/logout', async (req, res) => {
     await invalidateSession(sessionToken);
   }
 
-  const isSecureConnection = req.secure || req.headers['x-forwarded-proto'] === 'https' || process.env.NODE_ENV === 'production';
-  res.clearCookie('vps_session_id', {
-    httpOnly: true,
-    secure: isSecureConnection,
-    sameSite: 'lax',
-    path: '/'
-  });
+  res.clearCookie('vps_session_id', sessionClearOptions({ config, req }));
 
   if (employee) {
-    logAudit(employee.name, employee.role, 'LOGOUT', employee.username, 'Employee logged out.', req.ip);
+    logAudit(employee.name, employee.role, 'LOGOUT', employee.username, 'Employee logged out.', req.clientIp);
   }
 
   res.json({ success: true, message: 'Logged out successfully.' });
@@ -1980,7 +2281,7 @@ app.get('/api/auth/me', async (req, res) => {
 
   res.json({
     success: true,
-    employee
+    employee: toPublicEmployee(employee)
   });
 });
 
@@ -2017,7 +2318,7 @@ app.post('/api/auth/beacon-logout', async (req, res) => {
   if (sessionToken) {
     await invalidateSession(sessionToken);
   }
-  res.clearCookie('vps_session_id');
+  res.clearCookie('vps_session_id', sessionClearOptions({ config, req }));
   res.json({ success: true });
 });
 
@@ -2030,11 +2331,11 @@ app.get('/api/employees', requireAuth, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       const [rows] = await dbPool.query(`SELECT id, name, username, role, status, email, two_factor_enabled, lastLogin, createdAt FROM \`portal_users\` ORDER BY createdAt ASC`);
-      return res.json({ success: true, source: 'mysql', employees: rows });
+      return res.json({ success: true, source: 'mysql', employees: rows.map(toPublicEmployee) });
     } catch (e) {}
   }
 
-  const safeEmployees = (memoryStore.portalUsers || defaultPortalUsers).map(u => ({
+  const safeEmployees = (memoryStore.portalUsers || defaultPortalUsers).map(u => toPublicEmployee({
     id: u.id,
     name: u.name,
     username: u.username,
@@ -2092,7 +2393,7 @@ app.post('/api/employees', requireAdmin, async (req, res) => {
     } catch (e) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_CREATED', newEmployee.username, `Created employee ${newEmployee.name} (${newEmployee.role})`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_CREATED', newEmployee.username, `Created employee ${newEmployee.name} (${newEmployee.role})`, req.clientIp);
 
   res.status(201).json({
     success: true,
@@ -2135,9 +2436,9 @@ app.put('/api/employees/:id', requireAdmin, async (req, res) => {
     } catch (e) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_UPDATED', emp.username, `Updated employee ${emp.name}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_UPDATED', emp.username, `Updated employee ${emp.name}`, req.clientIp);
 
-  res.json({ success: true, employee: emp });
+  res.json({ success: true, employee: toPublicEmployee(emp) });
 });
 
 // PUT /api/employees/:id/status (Suspend / Activate)
@@ -2164,9 +2465,9 @@ app.put('/api/employees/:id/status', requireAdmin, async (req, res) => {
     } catch (e) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, status === 'SUSPENDED' ? 'EMPLOYEE_SUSPENDED' : 'EMPLOYEE_ACTIVATED', emp.username, `Employee status changed to ${status}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, status === 'SUSPENDED' ? 'EMPLOYEE_SUSPENDED' : 'EMPLOYEE_ACTIVATED', emp.username, `Employee status changed to ${status}`, req.clientIp);
 
-  res.json({ success: true, employee: emp });
+  res.json({ success: true, employee: toPublicEmployee(emp) });
 });
 
 // PUT /api/employees/:id/reset-password
@@ -2207,7 +2508,7 @@ app.put('/api/employees/:id/reset-password', requireAdmin, async (req, res) => {
     return res.status(404).json({ success: false, error: 'Employee not found.' });
   }
 
-  logAudit(req.employee.name, req.employee.role, 'PASSWORD_RESET', targetUsername, `Admin reset password for employee ${targetUsername}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'PASSWORD_RESET', targetUsername, `Admin reset password for employee ${targetUsername}`, req.clientIp);
 
   res.json({ success: true, message: 'Password reset successfully.' });
 });
@@ -2230,7 +2531,7 @@ app.delete('/api/employees/:id', requireAdmin, async (req, res) => {
     } catch (e) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_DELETED', emp.username, `Deleted employee ${emp.name}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'EMPLOYEE_DELETED', emp.username, `Deleted employee ${emp.name}`, req.clientIp);
 
   res.json({ success: true });
 });
@@ -2289,7 +2590,7 @@ app.delete('/api/sessions/:id', requireAdmin, async (req, res) => {
     saveDiskDatabase();
   }
 
-  logAudit(req.employee.name, req.employee.role, 'SESSION_TERMINATED', id, `Admin terminated session ${id}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'SESSION_TERMINATED', id, `Admin terminated session ${id}`, req.clientIp);
 
   res.json({ success: true, message: 'Session terminated successfully.' });
 });
@@ -2306,7 +2607,7 @@ app.get('/api/servers', requireAuth, async (req, res) => {
   // 1. Redis Cache Lookup
   const cachedServers = await redisGet(`vps:servers:${roleKey}`);
   if (cachedServers) {
-    return res.json({ success: true, source: 'redis', servers: cachedServers });
+    return res.json({ success: true, source: 'redis', servers: cachedServers.map(toPublicServer) });
   }
 
   let serverList = [];
@@ -2316,12 +2617,17 @@ app.get('/api/servers', requireAuth, async (req, res) => {
       const [rows] = await dbPool.query(`SELECT * FROM \`vps_servers\` ORDER BY \`createdAt\` ASC`);
       serverList = rows.map(r => {
         const existingInMemory = (memoryStore.servers || []).find(s => s.id === r.id);
-        return {
-          ...r,
+        const { meta: rawMeta, ...row } = r;
+        const merged = {
+          ...row,
           availableDrives: typeof r.availableDrives === 'string' ? JSON.parse(r.availableDrives) : r.availableDrives,
           lastKnownDisabledUsers: existingInMemory?.lastKnownDisabledUsers || (typeof r.lastKnownDisabledUsers === 'string' ? JSON.parse(r.lastKnownDisabledUsers) : (r.lastKnownDisabledUsers || [])),
           lastKnownAllUsers: existingInMemory?.lastKnownAllUsers || (typeof r.lastKnownAllUsers === 'string' ? JSON.parse(r.lastKnownAllUsers) : (r.lastKnownAllUsers || []))
         };
+        applyMeta(merged, rawMeta);
+        // Live in-memory runtime values are fresher than the stored meta
+        if (existingInMemory) applyMeta(merged, pickMeta(existingInMemory));
+        return merged;
       });
       memoryStore.servers = serverList;
       saveDiskDatabase();
@@ -2332,7 +2638,7 @@ app.get('/api/servers', requireAuth, async (req, res) => {
     serverList = memoryStore.servers || [];
   }
 
-  // Mask superClientPass if not SuperAdmin and attach physicalDisks
+  // Strip superClientPass (Requirement 7.10) and attach physicalDisks
   const sanitizedServers = serverList.map(s => {
     const sIpPure = s.ipPort ? s.ipPort.split(':')[0] : '';
     const telem = telemetryStore[s.id] || telemetryStore[s.ipPort] || (sIpPure ? telemetryStore[sIpPure] : null);
@@ -2340,12 +2646,11 @@ app.get('/api/servers', requireAuth, async (req, res) => {
       ? telem.physicalDisks
       : (Array.isArray(s.physicalDisks) ? s.physicalDisks : []);
 
-    return {
+    return toPublicServer({
       ...s,
       specs: sanitizeServerSpecs(s.specs),
-      superClientPass: isSuperAdmin ? s.superClientPass : '••••••••',
       physicalDisks: livePhysical
-    };
+    });
   });
 
   // Cache in Redis for 60 seconds
@@ -2361,16 +2666,41 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
   if (!newServer.id) newServer.id = `vps-${Date.now()}`;
 
   const idx = memoryStore.servers.findIndex(item => item.id === newServer.id);
+
+  // Agent key: a client-supplied apiKey is never trusted. A new server gets a fresh key (only the hash
+  // is stored); an existing server keeps its current hash (use rotate-agent-key to change it).
+  const existingServer = idx >= 0 ? memoryStore.servers[idx] : null;
+  let issuedAgentKey = null;
+  delete newServer.apiKey;
+  delete newServer.previousApiKey;
+  delete newServer.previousKeyExpiresAt;
+  if (existingServer && typeof existingServer.apiKey === 'string' && existingServer.apiKey) {
+    newServer.apiKey = existingServer.apiKey;
+    newServer.previousApiKey = existingServer.previousApiKey || '';
+    newServer.previousKeyExpiresAt = existingServer.previousKeyExpiresAt ?? null;
+  } else {
+    issuedAgentKey = generateAgentKey();
+    newServer.apiKey = hashAgentKey(issuedAgentKey);
+  }
+
+  try {
+    if (newServer.superClientPass === MASKED_SECRET && existingServer) newServer.superClientPass = existingServer.superClientPass || '';
+    newServer.superClientPass = sealPw(newServer.superClientPass);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the server password' });
+  }
+
   if (idx >= 0) {
     memoryStore.servers[idx] = newServer;
   } else {
-    // Remove from deletedServers tombstone if explicitly re-added by admin
-  if (memoryStore.deletedServers && Array.isArray(memoryStore.deletedServers)) {
-    const sTarget = (newServer.ipPort || newServer.id || '').toLowerCase();
-    const pIp = sTarget.split(':')[0];
-    memoryStore.deletedServers = memoryStore.deletedServers.filter(d => d !== sTarget && d !== pIp && d !== newServer.id.toLowerCase());
-  }
-  memoryStore.servers.push(newServer);
+    // Remove the tombstones if explicitly re-added by admin (Req 10.12)
+    try {
+      await restoreServerTombstones(newServer);
+    } catch (err) {
+      console.error('[ADD SERVER] Could not clear tombstones:', err.message);
+      return res.status(500).json({ success: false, error: 'Unable to restore the server' });
+    }
+    memoryStore.servers.push(newServer);
   }
   saveDiskDatabase();
 
@@ -2381,8 +2711,8 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `REPLACE INTO \`vps_servers\` (id, name, serverType, tallySerial, ipPort, httpUrl, httpsUrl, superClientUser, superClientPass, totalUsersLimit, specs, portSerial, status, availableDrives)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `REPLACE INTO \`vps_servers\` (id, name, serverType, tallySerial, ipPort, httpUrl, httpsUrl, superClientUser, superClientPass, totalUsersLimit, specs, portSerial, status, availableDrives, apiKey, previousApiKey, previousKeyExpiresAt, meta)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newServer.id,
           newServer.name || 'VPS Node',
@@ -2397,7 +2727,11 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
           newServer.specs || '',
           newServer.portSerial || '',
           newServer.status || 'Active',
-          JSON.stringify(newServer.availableDrives || ['Drive C'])
+          JSON.stringify(newServer.availableDrives || ['Drive C']),
+          newServer.apiKey || null,
+          newServer.previousApiKey || null,
+          newServer.previousKeyExpiresAt ?? null,
+          JSON.stringify(pickMeta(newServer))
         ]
       );
     } catch (err) {
@@ -2405,25 +2739,235 @@ app.post('/api/servers', requireAdmin, async (req, res) => {
     }
   }
 
-  logAudit(req.employee.name, req.employee.role, 'SERVER_CREATED', newServer.name, `Added VPS node ${newServer.name} (${newServer.ipPort})`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'SERVER_CREATED', newServer.name, `Added VPS node ${newServer.name} (${newServer.ipPort})`, req.clientIp);
 
-  const rawHost = String(req.headers['x-forwarded-host'] || req.get('host') || 'vps.innovationwebworks.in').split(',')[0].trim();
-  const portalHost = (rawHost.includes('127.0.0.1') || rawHost.includes('localhost')) ? 'vps.innovationwebworks.in' : rawHost;
-  const rawProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const protocol = rawProto || (portalHost.includes('innovationwebworks.in') ? 'https' : req.protocol);
-  const portalBaseUrl = `${protocol}://${portalHost}`;
+  const portalBaseUrl = buildPortalUrl(config);
   const targetId = newServer.ipPort || newServer.id;
   const encodedId = encodeURIComponent(targetId);
 
-  res.json({
+  // One-time installer token (15 min, bound to this server) so the generated installer embeds the key
+  const installerQuery = issuedAgentKey
+    ? `s=${encodedId}&t=${encodeURIComponent(issueInstallerToken(newServer.id, issuedAgentKey))}`
+    : `s=${encodedId}`;
+  const installerUrl = `${portalBaseUrl}/install.ps1?${installerQuery}`;
+
+  const { apiKey: _omitHash, ...serverForResponse } = newServer;
+  const createResponse = {
     success: true,
-    server: newServer,
+    server: toPublicServer(serverForResponse),
     agentInstall: {
       serverId: targetId,
-      installerUrl: `${portalBaseUrl}/install.ps1?s=${encodedId}`,
-      powershellCommand: `[Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192; (New-Object Net.WebClient).DownloadString('${portalBaseUrl}/install.ps1?s=${encodedId}') | iex`,
+      installerUrl,
+      powershellCommand: `[Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 -bor 192; (New-Object Net.WebClient).DownloadString('${installerUrl}') | iex`,
     }
-  });
+  };
+  if (issuedAgentKey) createResponse.agentKey = issuedAgentKey; // plaintext, shown once
+  res.json(createResponse);
+});
+
+// ---------------------------------------------------------------------------
+// One-time installer tokens (Requirement 2.8): 15 minutes, bound to one server, consumed on first use.
+// The plaintext key lives only in this in-memory map until the token is used or expires; it is never
+// logged or persisted.
+// ---------------------------------------------------------------------------
+const INSTALLER_TOKEN_TTL_MS = 15 * 60 * 1000;
+const installerTokens = new Map(); // token -> { serverId, agentKey, expiresAt }
+
+function purgeExpiredInstallerTokens() {
+  const now = Date.now();
+  for (const [tok, v] of installerTokens) {
+    if (v.expiresAt <= now) installerTokens.delete(tok);
+  }
+}
+
+function issueInstallerToken(serverId, agentKey) {
+  purgeExpiredInstallerTokens();
+  const token = crypto.randomBytes(32).toString('base64url');
+  installerTokens.set(token, { serverId, agentKey, expiresAt: Date.now() + INSTALLER_TOKEN_TTL_MS });
+  return token;
+}
+
+// Returns { serverId, agentKey } and deletes the token, or null when unknown / expired / bound to another server.
+function consumeInstallerToken(token, expectedServer) {
+  purgeExpiredInstallerTokens();
+  const entry = typeof token === 'string' ? installerTokens.get(token) : null;
+  if (!entry) return null;
+  if (expectedServer && entry.serverId !== expectedServer.id) return null;
+  installerTokens.delete(token);
+  return { serverId: entry.serverId, agentKey: entry.agentKey };
+}
+
+// Store used by rotateAgentKey. The new hash and the grace fields change in ONE UPDATE; memory is
+// changed only after the database accepted it (Requirements 2.6, 2.12).
+function makeAgentKeyStore(server) {
+  return {
+    async findServer() { return server; },
+    async setAgentKeyRecord(sid, record) {
+      const prevHash = record.previousApiKey ? record.previousApiKey : null;
+      const prevExp = record.previousKeyExpiresAt ?? null;
+      if (isMysqlConnected && dbPool) {
+        const [result] = await dbPool.query(
+          'UPDATE `vps_servers` SET `apiKey` = ?, `previousApiKey` = ?, `previousKeyExpiresAt` = ? WHERE `id` = ?',
+          [record.apiKey, prevHash, prevExp, sid]
+        );
+        if (!result || result.affectedRows !== 1) throw new Error('hash update did not apply');
+      }
+      server.apiKey = record.apiKey;
+      server.previousApiKey = record.previousApiKey || '';
+      server.previousKeyExpiresAt = prevExp;
+      saveDiskDatabase();
+    }
+  };
+}
+
+// POST /api/servers/:id/rotate-agent-key (SUPER_ADMIN only)
+app.post('/api/servers/:id/rotate-agent-key', requireAuth, async (req, res) => {
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  const id = String(req.params.id || '');
+  const server = (memoryStore.servers || []).find((s) => s && s.id === id);
+  if (!server) return res.status(404).json({ success: false, error: 'Server not found' });
+
+  // graceMinutes: optional integer 0..1440 (default 0); anything else is a 400 with no change and no audit entry
+  const rotBody = req.body && typeof req.body === 'object' ? req.body : {};
+  const graceMinutes = rotBody.graceMinutes === undefined ? 0 : rotBody.graceMinutes;
+  if (!Number.isInteger(graceMinutes) || graceMinutes < 0 || graceMinutes > 1440) {
+    return res.status(400).json({ success: false, error: 'graceMinutes must be an integer between 0 and 1440' });
+  }
+
+  try {
+    const { agentKey } = await rotateAgentKey({
+      serverId: server.id,
+      graceMinutes,
+      store: makeAgentKeyStore(server)
+    });
+
+    await redisDel('vps:servers:admin');
+    await redisDel('vps:servers:staff');
+    // Audit: actor, server id, action only (no key, no hash)
+    logAudit(req.employee.name, req.employee.role, 'AGENT_KEY_ROTATED', server.id, `Agent key rotated (graceMinutes=${graceMinutes})`, req.clientIp);
+    const expiresMs = server.previousKeyExpiresAt;
+    const previousKeyExpiresAt = Number.isFinite(Number(expiresMs)) && expiresMs !== null ? new Date(Number(expiresMs)).toISOString() : null;
+
+    const baseUrl = config.portalBaseUrl ? String(config.portalBaseUrl).replace(/\/+$/, '') : '';
+    const token = issueInstallerToken(server.id, agentKey);
+    const installerUrl = `${baseUrl}/install.ps1?s=${encodeURIComponent(server.ipPort || server.id)}&t=${encodeURIComponent(token)}`;
+    res.set('Cache-Control', 'no-store');
+    return res.json({ agentKey, installerUrl, graceMinutes, previousKeyExpiresAt });
+  } catch (err) {
+    if (err instanceof RotationError && err.code === 'NOT_FOUND') {
+      return res.status(404).json({ success: false, error: 'Server not found' });
+    }
+    console.error('[agent-key] rotation failed for server', id);
+    return res.status(500).json({ success: false, error: 'Key rotation failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Agent key delivery to installed agents (design section 19). warn mode only.
+// ---------------------------------------------------------------------------
+const AGENT_KEY_MIN_VERSION = String(process.env.AGENT_KEY_MIN_VERSION || '2.1.0').trim() || '2.1.0';
+
+// Returns { status: 'queued'|'needs_update'|'skipped', serverId, reason? } and never a key or hash.
+const DEFAULT_DELIVERY_GRACE_MINUTES = 60;
+async function deliverAgentKeyToServer(server, { force, actor, graceMinutes = DEFAULT_DELIVERY_GRACE_MINUTES }) {
+  const serverId = server.id;
+  const hasHash = typeof server.apiKey === 'string' && server.apiKey.length > 0;
+  const st = agentKeyStatus.get(serverId);
+  if (hasHash && st && st.valid === true && !force) {
+    return { status: 'skipped', serverId, reason: 'already_has_valid_key' };
+  }
+
+  if (needsAgentUpdate(server.agentVersion, AGENT_KEY_MIN_VERSION)) {
+    queueServerJob({ action: 'UPDATE_AGENT', serverId, username: 'SYSTEM' });
+    return { status: 'needs_update', serverId, reason: 'agent_version_below_minimum' };
+  }
+
+  let agentKey;
+  try {
+    // The agent still sends the old key while it polls for this job, so keep it valid (Requirement 26.14)
+    ({ agentKey } = await rotateAgentKey({
+      serverId,
+      graceMinutes: hasHash ? graceMinutes : 0,
+      store: makeAgentKeyStore(server)
+    }));
+  } catch {
+    return { status: 'skipped', serverId, reason: 'key_store_failed' };
+  }
+
+  queueServerJob({ action: 'SET_AGENT_KEY', serverId, username: 'SYSTEM', agentKey });
+  agentKey = null;
+  logAudit(actor.name, actor.role, 'AGENT_KEY_DELIVERY_QUEUED', serverId, 'Agent key delivery queued', actor.ip);
+  return { status: 'queued', serverId };
+}
+
+async function handleAgentKeyDelivery(req, res, servers, force, graceMinutes) {
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  if (config.agentAuthMode !== 'warn') {
+    return res.status(409).json({ success: false, error: 'Agent key delivery is only allowed while AGENT_AUTH_MODE=warn' });
+  }
+  const baseUrl = String(config.portalBaseUrl || '');
+  if (!/^https:\/\//i.test(baseUrl)) {
+    if (config.isProduction) {
+      return res.status(409).json({ success: false, error: 'PORTAL_BASE_URL must be https:// to deliver agent keys' });
+    }
+    console.warn('[agent-key] delivering agent keys over a non-https PORTAL_BASE_URL (allowed outside production)');
+  }
+
+  if (graceMinutes !== undefined && (!Number.isInteger(graceMinutes) || graceMinutes < 0 || graceMinutes > 1440)) {
+    return res.status(400).json({ success: false, error: 'graceMinutes must be an integer between 0 and 1440' });
+  }
+  const actor = { name: req.employee.name, role: req.employee.role, ip: req.clientIp };
+  const out = { queued: [], needs_update: [], skipped: [] };
+  for (const server of servers) {
+    try {
+      const r = await deliverAgentKeyToServer(server, graceMinutes === undefined ? { force, actor } : { force, actor, graceMinutes });
+      if (r.status === 'queued') out.queued.push(r.serverId);
+      else if (r.status === 'needs_update') out.needs_update.push({ serverId: r.serverId, reason: r.reason });
+      else out.skipped.push({ serverId: r.serverId, reason: r.reason });
+    } catch {
+      out.skipped.push({ serverId: server.id, reason: 'delivery_failed' });
+    }
+  }
+  try {
+    await redisDel('vps:servers:admin');
+    await redisDel('vps:servers:staff');
+  } catch { /* cache invalidation is best effort */ }
+  res.set('Cache-Control', 'no-store');
+  return res.json({ success: true, ...out });
+}
+
+// POST /api/servers/deploy-agent-keys (SUPER_ADMIN only; bulk)
+app.post('/api/servers/deploy-agent-keys', requireAuth, async (req, res) => {
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const all = (memoryStore.servers || []).filter(Boolean);
+  let selected = all;
+  if (body.serverIds !== undefined && body.serverIds !== null) {
+    if (!Array.isArray(body.serverIds)) {
+      return res.status(400).json({ success: false, error: 'serverIds must be an array' });
+    }
+    const wanted = new Set(body.serverIds.map((v) => String(v)));
+    selected = all.filter((s) => wanted.has(s.id));
+  }
+  return handleAgentKeyDelivery(req, res, selected, body.force === true, body.graceMinutes);
+});
+
+// POST /api/servers/:id/deploy-agent-key (SUPER_ADMIN only)
+app.post('/api/servers/:id/deploy-agent-key', requireAuth, async (req, res) => {
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  const id = String(req.params.id || '');
+  const server = (memoryStore.servers || []).find((s) => s && s.id === id);
+  if (!server) return res.status(404).json({ success: false, error: 'Server not found' });
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  return handleAgentKeyDelivery(req, res, [server], body.force === true, body.graceMinutes);
 });
 
 // PUT SERVER (Admin Only)
@@ -2433,6 +2977,23 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
   s.id = id;
 
   const idx = memoryStore.servers.findIndex(item => item.id === id);
+  // The key hash is only changed by rotate-agent-key; an edit must neither wipe nor overwrite it
+  const keptHash = idx >= 0 && typeof memoryStore.servers[idx].apiKey === 'string' ? memoryStore.servers[idx].apiKey : '';
+  if (keptHash) s.apiKey = keptHash; else delete s.apiKey;
+  if (idx >= 0) {
+    s.previousApiKey = memoryStore.servers[idx].previousApiKey || '';
+    s.previousKeyExpiresAt = memoryStore.servers[idx].previousKeyExpiresAt ?? null;
+  } else {
+    delete s.previousApiKey;
+    delete s.previousKeyExpiresAt;
+  }
+  try {
+    // Responses no longer carry superClientPass, so a blank or masked value from an edit form keeps the stored one
+    if ((!s.superClientPass || s.superClientPass === MASKED_SECRET) && idx >= 0) s.superClientPass = memoryStore.servers[idx].superClientPass || '';
+    s.superClientPass = sealPw(s.superClientPass);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the server password' });
+  }
   if (idx >= 0) {
     memoryStore.servers[idx] = s;
   } else {
@@ -2443,8 +3004,8 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `REPLACE INTO \`vps_servers\` (id, name, serverType, tallySerial, ipPort, httpUrl, httpsUrl, superClientUser, superClientPass, totalUsersLimit, specs, portSerial, status, availableDrives)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `REPLACE INTO \`vps_servers\` (id, name, serverType, tallySerial, ipPort, httpUrl, httpsUrl, superClientUser, superClientPass, totalUsersLimit, specs, portSerial, status, availableDrives, apiKey, previousApiKey, previousKeyExpiresAt, meta)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           s.id,
           s.name || 'VPS Node',
@@ -2459,7 +3020,11 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
           s.specs || '',
           s.portSerial || '',
           s.status || 'Active',
-          JSON.stringify(s.availableDrives || ['Drive C'])
+          JSON.stringify(s.availableDrives || ['Drive C']),
+          s.apiKey || null,
+          s.previousApiKey || null,
+          s.previousKeyExpiresAt ?? null,
+          JSON.stringify(pickMeta(s))
         ]
       );
     } catch (err) {
@@ -2467,47 +3032,44 @@ app.put('/api/servers/:id', requireAdmin, async (req, res) => {
     }
   }
 
-  logAudit(req.employee.name, req.employee.role, 'SERVER_UPDATED', s.name, `Updated VPS node ${s.name} (${s.ipPort})`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'SERVER_UPDATED', s.name, `Updated VPS node ${s.name} (${s.ipPort})`, req.clientIp);
 
   // Invalidate Redis server caches
   await redisDel('vps:servers:admin');
   await redisDel('vps:servers:staff');
 
-  res.json({ success: true, server: s });
+  res.json({ success: true, server: toPublicServer(s) });
 });
 
 // DELETE SERVER (Admin Only)
 app.delete('/api/servers/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const targetServer = (memoryStore.servers || []).find(s => s.id === id);
-  if (!memoryStore.deletedServers) memoryStore.deletedServers = [];
-  if (targetServer) {
-    if (targetServer.id) memoryStore.deletedServers.push(targetServer.id.toLowerCase());
-    if (targetServer.ipPort) {
-      memoryStore.deletedServers.push(targetServer.ipPort.toLowerCase());
-      const pIp = targetServer.ipPort.split(':')[0].toLowerCase();
-      if (pIp) memoryStore.deletedServers.push(pIp);
+  const es = getEntityStore();
+  if (es) {
+    // MySQL mode: tombstones, snapshot and the vps_servers delete commit in one transaction (Req 10.12, 10.13).
+    // On failure nothing changes: the server stays active and an error is returned.
+    try {
+      await deleteServerWithTombstones(es, targetServer || id);
+    } catch (err) {
+      console.error('[DELETE SERVER] Atomic delete failed; server retained:', err?.cause?.message || err.message);
+      return res.status(500).json({ success: false, error: 'Server deletion failed; the server was not deleted' });
     }
-    if (targetServer.name) memoryStore.deletedServers.push(targetServer.name.toLowerCase());
   } else {
-    memoryStore.deletedServers.push(id.toLowerCase());
-    const pIp = id.split(':')[0].toLowerCase();
-    if (pIp) memoryStore.deletedServers.push(pIp);
+    // JSON / memory fallback (MySQL unavailable): tombstones live in memoryStore.deletedServers.
+    if (!Array.isArray(memoryStore.deletedServers)) memoryStore.deletedServers = [];
+    for (const t of tombstoneTerms(targetServer || id)) {
+      if (!memoryStore.deletedServers.includes(t)) memoryStore.deletedServers.push(t);
+    }
   }
   memoryStore.servers = (memoryStore.servers || []).filter(s => s.id !== id);
   saveDiskDatabase();
-
-  if (isMysqlConnected && dbPool) {
-    try {
-      await dbPool.query(`DELETE FROM \`vps_servers\` WHERE id=?`, [id]);
-    } catch (err) {}
-  }
 
   // Invalidate Redis server caches
   await redisDel('vps:servers:admin');
   await redisDel('vps:servers:staff');
 
-  logAudit(req.employee.name, req.employee.role, 'SERVER_DELETED', id, `Deleted VPS node ${id}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'SERVER_DELETED', id, `Deleted VPS node ${id}`, req.clientIp);
 
   res.json({ success: true });
 });
@@ -2694,7 +3256,64 @@ function doesServerMatch(jobServerId, targetIdentifier) {
   return false;
 }
 
-function queueServerJob({
+// Route guard for job-feeding routes: bad body input => 400 { success:false, error:'Invalid request parameters' }, nothing queued.
+// Never mount on login or other portal-user password routes.
+const jobRequestGuard = validateJobRequest({ getConfig: () => config, sanitizeUsername: sanitizeWindowsUsername });
+
+// Async route wrapper (Express 4 does not forward rejected promises): any error thrown by the handler reaches next(err),
+// so the request is always answered and never becomes an unhandledRejection.
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve().then(() => fn(req, res, next)).catch(next);
+  };
+}
+
+// For routes that validate and queue agent jobs. JobParamError, and any other error without an HTTP status of its own,
+// answers 400 { success:false, error:'Invalid request parameters' } and never echoes the input. Errors that already carry
+// a status (DbUnavailableError, http-errors style statusCode/status) keep it via the final error handler.
+function jobRouteHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve().then(() => fn(req, res, next)).catch((err) => {
+      if (res.headersSent) return next(err);
+      const status = Number(err && (err.statusCode || err.status));
+      const hasOwnStatus = err instanceof DbUnavailableError || (status >= 400 && status <= 599);
+      if (err instanceof JobParamError || !hasOwnStatus) {
+        console.error(`[Job] ${req.method} ${req.path}: rejected (${err && err.name ? err.name : 'Error'})`);
+        return res.status(400).json({ success: false, error: 'Invalid request parameters' });
+      }
+      return next(err);
+    });
+  };
+}
+
+function queueServerJob(rawParams = {}) {
+  return queueValidatedServerJob(prepareJobParams(rawParams));
+}
+
+// Validates (and normalizes) job params WITHOUT queueing anything. Throws JobParamError on bad input.
+// Callers that mutate state before queueing (e.g. POST /api/users) call this first, then queueValidatedServerJob.
+function prepareJobParams(rawParams = {}) {
+  // Validate BEFORE anything is pushed to memoryStore.provisionJobs or inserted into MySQL.
+  // 'SYSTEM' is the internal marker username for server-wide jobs (UPDATE_AGENT, disk jobs, ...), not an OS account.
+  const toValidate = { ...rawParams };
+  if (typeof toValidate.drive === 'string') toValidate.drive = toValidate.drive.replace(/^Drive\s+/i, '').trim();
+  const isInternalUser = toValidate.username === 'SYSTEM';
+  if (isInternalUser) delete toValidate.username;
+  let validated;
+  try {
+    validated = validateJobParams(toValidate, { config, sanitizeUsername: sanitizeWindowsUsername });
+  } catch (err) {
+    if (err instanceof JobParamError) {
+      const store = jobParamContext.getStore();
+      if (store) store.rejected = true;
+    }
+    throw err;
+  }
+  if (isInternalUser) validated.username = 'SYSTEM';
+  return validated;
+}
+
+function queueValidatedServerJob({
   action = 'PROVISION_TALLY_USER',
   serverId,
   username,
@@ -2718,9 +3337,11 @@ function queueServerJob({
   sha256 = '',
   fileSizeBytes = null,
   downloadUrl = '',
-  uploadUrl = ''
+  uploadUrl = '',
+  agentKey = ''
 }) {
-  const pwd = password || newPassword || '';
+  // Sealed before the job exists anywhere (memoryStore, database.json, MySQL). Throws if sealing fails: no job is created.
+  const pwd = sealPw(password || newPassword || '');
   const cleanDrive = (drive || 'D:').replace(/^Drive\s+/i, '').trim();
   const cleanUsername = sanitizeWindowsUsername(username) || (username ? String(username).replace(/\s+\d+$/, '').trim() : '');
   const job = {
@@ -2749,6 +3370,8 @@ function queueServerJob({
     fileSizeBytes: fileSizeBytes ? Number(fileSizeBytes) : undefined,
     downloadUrl: downloadUrl || '',
     uploadUrl: uploadUrl || '',
+    // Memory copy only: the INSERT INTO vps_provision_jobs below never writes agentKey
+    ...(agentKey ? { agentKey: String(agentKey) } : {}),
     status: 'PENDING',
     resultMessage: '',
     createdAt: new Date().toISOString()
@@ -2784,7 +3407,7 @@ function queueServerJob({
       agentJobEmitter.emit(`job:${alias}`, job);
     });
     // agentJobEmitter.emit("job:any", job); // Disabled: jobs are targeted strictly by server alias
-    console.log(`⚡ [INSTANT DISPATCH] Emitted 0-second job trigger for server ${sId} (Action: ${job.action}, User: ${job.username}, Aliases: ${Array.from(allAliases).join(', ')})`);
+    console.log(`âš¡ [INSTANT DISPATCH] Emitted 0-second job trigger for server ${sId} (Action: ${job.action}, User: ${job.username}, Aliases: ${Array.from(allAliases).join(', ')})`);
   } catch (eEmit) {
     console.error("agentJobEmitter error:", eEmit.message);
   }
@@ -2825,6 +3448,55 @@ function queueLogoffSessionJob({ serverId, sessionId, username }) {
   });
 }
 
+// Drops jobs carrying an agentKey unless the request comes from the server's registered IP
+// (and HTTPS in production). Dropped jobs stay PENDING. req.secure honours X-Forwarded-Proto
+// only from trusted proxies (see 'trust proxy' above). Logs serverId only, throttled.
+const deliveryWarnAt = new Map();
+// Every agent-facing job delivery goes through here. Stored jobs hold sealed passwords; the plaintext
+// exists only in the per-response copy built below. A job whose password cannot be decrypted is not
+// dispatched: it is failed with a message that carries no password data.
+function filterDeliverableJobs(req, jobs) {
+  const deliverable = filterKeyDeliverableJobs(req, jobs);
+  if (!Array.isArray(deliverable) || deliverable.length === 0) return deliverable;
+  const out = [];
+  for (const job of deliverable) {
+    if (!job || (!job.password && !job.newPassword)) { out.push(job); continue; }
+    try {
+      out.push({ ...job, password: openPw(job.password), newPassword: openPw(job.newPassword || job.password) });
+    } catch {
+      job.completedAt = new Date().toISOString();
+      finishJob(provisionJobDeps(), job.id, 'FAILED', 'Password cannot be decrypted; job was not dispatched.').catch(() => {});
+      saveDiskDatabase();
+      console.error(`[Passwords] Job ${job.id} not dispatched: stored password cannot be decrypted`);
+    }
+  }
+  return out;
+}
+
+function filterKeyDeliverableJobs(req, jobs) {
+  if (!Array.isArray(jobs) || jobs.length === 0) return jobs;
+  return jobs.filter((job) => {
+    if (!job || !job.agentKey) return true;
+    const server = (memoryStore.servers || []).find((s) => s.id === job.serverId || s.ipPort === job.serverId || doesServerMatch(s.id, job.serverId)) || null;
+    const ok = isJobDeliverable({
+      job,
+      server,
+      clientIp: req.clientIp,
+      secure: req.secure === true,
+      isProduction: config.isProduction === true
+    });
+    if (!ok) {
+      const now = Date.now();
+      const last = deliveryWarnAt.get(job.serverId) || 0;
+      if (now - last > 60000) {
+        deliveryWarnAt.set(job.serverId, now);
+        console.warn(`[AGENT KEY] Withheld key job from non-registered or insecure request for serverId=${job.serverId}`);
+      }
+    }
+    return ok;
+  });
+}
+
 function getPendingProvisionJobsForServer(targetId, queryTerm, ipPort) {
   if (!memoryStore.provisionJobs || memoryStore.provisionJobs.length === 0) return [];
   const now = Date.now();
@@ -2835,11 +3507,8 @@ function getPendingProvisionJobsForServer(targetId, queryTerm, ipPort) {
       const isMigrationJob = (j.action === 'EXPORT_CLIENT_DATA' || j.action === 'IMPORT_CLIENT_DATA');
       const maxAgeMs = isMigrationJob ? 120 * 60 * 1000 : 15 * 60 * 1000;
       if (ageMs > maxAgeMs) {
-        j.status = 'FAILED';
-        j.resultMessage = `Job timed out after ${Math.round(maxAgeMs / 60000)} minutes.`;
-        if (isMysqlConnected && dbPool) {
-          dbPool.query('UPDATE `vps_provision_jobs` SET `status` = ?, `resultMessage` = ?, `updatedAt` = CURRENT_TIMESTAMP WHERE `id` = ?', ['FAILED', j.resultMessage, j.id]).catch(() => {});
-        }
+        // Memory is updated synchronously inside finishJob; the DB write runs in the background.
+        finishJob(provisionJobDeps(), j.id, 'FAILED', `Job timed out after ${Math.round(maxAgeMs / 60000)} minutes.`).catch(() => {});
       }
     }
   }
@@ -2853,6 +3522,88 @@ function getPendingProvisionJobsForServer(targetId, queryTerm, ipPort) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Agent authentication (Requirements 1, 4). Agent identity comes only from the
+// X-Agent-Key header; serverId / X-Server-Id are identification hints, never authentication.
+// ---------------------------------------------------------------------------
+const agentKeyStatus = new Map(); // serverId -> { valid, at } (in memory, resets on restart)
+
+const AGENT_ENDPOINT_PATHS = [
+  '/api/agent/telemetry',
+  '/api/agent/job-result',
+  '/api/agent/session-event',
+  '/api/agent/duplicate-session-event',
+  '/api/agent/migration/upload-full',
+  '/api/agent/migration/upload-chunk',
+  '/api/agent/migration/download-chunk',
+  '/api/agent/detect-server',
+  '/api/agent/my-ip',
+  '/api/agent/listen-jobs',
+  '/api/agent/poll-instant'
+];
+
+function agentHeader(req, name) {
+  const v = req.headers?.[name];
+  const s = Array.isArray(v) ? v[0] : v;
+  return typeof s === 'string' ? s.trim() : '';
+}
+
+// Per-endpoint rule table: which server does this request claim to be?
+async function resolveAgentServer(req, servers, submittedKey) {
+  const p = String(req.originalUrl || req.url || '').split('?')[0].replace(/\/+$/, '');
+  const strOf = (v) => (typeof v === 'string' ? v.trim() : '');
+
+  if (p === '/api/agent/detect-server' || p === '/api/agent/my-ip') {
+    if (!submittedKey) return { server: null, ref: '' };
+    const h = hashAgentKey(submittedKey);
+    const m = servers.filter((s) => s && s.apiKey === h);
+    return { server: m.length === 1 ? m[0] : null, ref: '' };
+  }
+
+  if (p.startsWith('/api/agent/migration/')) {
+    const migrationId = strOf(req.query?.migrationId);
+    const mig = migrationId ? await migGet(migrationId) : null;
+    const ref = mig ? (p.endsWith('/download-chunk') ? mig.targetServerId : mig.sourceServerId) : '';
+    return { server: ref ? findServerForKeyCheck(servers, ref) : null, ref: ref || migrationId };
+  }
+
+  if (p === '/api/agent/listen-jobs' || p === '/api/agent/poll-instant') {
+    const ref = strOf(req.query?.serverId) || strOf(req.body?.serverId) || agentHeader(req, 'x-server-id');
+    return { server: ref ? findServerForKeyCheck(servers, ref) : null, ref };
+  }
+
+  const ref = strOf(req.body?.serverId);
+  return { server: ref ? findServerForKeyCheck(servers, ref) : null, ref };
+}
+
+const agentAuthMiddleware = createAgentAuthMiddleware({
+  getServers: () => memoryStore.servers || [],
+  audit: (entry) =>
+    logAudit('Agent', 'SYSTEM', entry.action, entry.serverId, `endpoint=${entry.endpoint}`, entry.ip),
+  config,
+  keyStatus: agentKeyStatus,
+  resolveAgentServer,
+  // Counts failed authentications per client IP (task 29.6); successes never reach this hook
+  failureLimiter: (req) => {
+    const lim = config.rateLimits.AGENT_AUTH_FAIL;
+    return checkRateLimit('agentAuthFail', buildRateLimitKey('AGENT_AUTH_FAIL', req.clientIp), lim.max, lim.windowSec * 1000);
+  }
+});
+
+app.use(AGENT_ENDPOINT_PATHS, agentAuthMiddleware);
+
+// GET /api/agent-keys/status (admin): per-server key state, never returns keys or hashes
+app.get('/api/agent-keys/status', requireAdmin, async (req, res) => {
+  // readyForEnforce: see lib/agentKeyReadiness.js (empty server set is true; map is in memory,
+  // so it stays false after a restart until agents have polled again).
+  res.json(evaluateReadiness({
+    servers: memoryStore.servers || [],
+    deletedTokens: await activeServerDeletedTokens(),
+    keyStatus: agentKeyStatus,
+    now: Date.now()
+  }));
+});
+
 // POST /api/agent/telemetry (Called by Remote Windows VPS PowerShell Agent)
 app.post('/api/agent/telemetry', async (req, res) => {
   const { serverId, serverIp, cpuUsage, ram, disks, uptime, activeUsers, hardware, physicalDisks, occupiedDrives } = req.body;
@@ -2861,15 +3612,11 @@ app.post('/api/agent/telemetry', async (req, res) => {
   const queryTerm = decodeURIComponent(rawQuery).trim();
 
   // Extract real connecting client IP
-  const rawClientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.connection?.remoteAddress || req.ip || '';
-  const clientIp = String(rawClientIp).split(',')[0].trim().replace(/^.*:/, '');
+  const rawClientIp = req.clientIp;
+  const clientIp = String(rawClientIp);
   // Check if server was explicitly deleted by admin
-  if (memoryStore.deletedServers && Array.isArray(memoryStore.deletedServers)) {
-    const isDeleted = memoryStore.deletedServers.some(d => 
-      d === queryTerm.toLowerCase() || 
-      d === clientIp.toLowerCase() || 
-      (rawQuery && d === rawQuery.toLowerCase())
-    );
+  {
+    const isDeleted = await isServerTermDeleted([queryTerm, clientIp, rawQuery]);
     if (isDeleted) {
       return res.status(403).json({
         success: false,
@@ -2896,7 +3643,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
   if (clientIp && clientIp !== '127.0.0.1') {
     const serverByClientIp = (memoryStore.servers || []).find(s => s.ipPort && s.ipPort.split(':')[0].trim() === clientIp);
     if (serverByClientIp && (!matchedServer || matchedServer.id !== serverByClientIp.id)) {
-      console.log(`⚡ [AGENT AUTO-CORRECTION] Telemetry from IP ${clientIp} sent serverId '${queryTerm}', auto-corrected to Server '${serverByClientIp.name || serverByClientIp.ipPort}' (${serverByClientIp.id})`);
+      console.log(`âš¡ [AGENT AUTO-CORRECTION] Telemetry from IP ${clientIp} sent serverId '${queryTerm}', auto-corrected to Server '${serverByClientIp.name || serverByClientIp.ipPort}' (${serverByClientIp.id})`);
       matchedServer = serverByClientIp;
       correctedServerId = serverByClientIp.ipPort || serverByClientIp.id;
     }
@@ -2928,7 +3675,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
     : null;
 
   // Real hardware description
-  const realSpecs = hardware?.specs || (hardware?.cpuCores ? `${hardware.cpuCores} Cores (${hardware.cpuLogical} vCPU) • ${hardware.cpuName}` : null);
+  const realSpecs = hardware?.specs || (hardware?.cpuCores ? `${hardware.cpuCores} Cores (${hardware.cpuLogical} vCPU) â€¢ ${hardware.cpuName}` : null);
 
   // AUTO-CREATE MISSING SERVER NODE: ONLY if memoryStore.servers is completely empty!
   if (!matchedServer && (queryTerm || clientIp)) {
@@ -3140,7 +3887,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
 
     let verifiedSpecs = incomingSpecs;
     if (!verifiedSpecs && currRamGB && currRamGB > 0) {
-      verifiedSpecs = `${currCores ? `${currCores} Core${currLogical && currLogical !== currCores ? ` (${currLogical} vCPU)` : ''} / ` : ''}${currRamGB}GB RAM${currDiskGB ? ` / ${currDiskGB}GB Storage` : ''}${currCpuName ? ` • ${currCpuName}` : ''}`;
+      verifiedSpecs = `${currCores ? `${currCores} Core${currLogical && currLogical !== currCores ? ` (${currLogical} vCPU)` : ''} / ` : ''}${currRamGB}GB RAM${currDiskGB ? ` / ${currDiskGB}GB Storage` : ''}${currCpuName ? ` â€¢ ${currCpuName}` : ''}`;
     }
 
     if (verifiedSpecs) {
@@ -3189,7 +3936,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
           const diff = currRamGB - prevHw.ramTotalGB;
           const isUp = diff > 0;
           const deltaStr = `${isUp ? '+' : ''}${diff} GB`;
-          const desc = `${isUp ? 'RAM Upgraded (+)' : 'RAM Downsized / Reduced (-)'}: ${prevHw.ramTotalGB} GB ➔ ${currRamGB} GB (${deltaStr})`;
+          const desc = `${isUp ? 'RAM Upgraded (+)' : 'RAM Downsized / Reduced (-)'}: ${prevHw.ramTotalGB} GB âž” ${currRamGB} GB (${deltaStr})`;
           recordHardwareChange({
             serverId: matchedServer.id || targetId,
             serverName: matchedServer.name || targetId,
@@ -3212,7 +3959,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
           const diff = currCores - prevHw.cpuCores;
           const isUp = diff > 0;
           const deltaStr = `${isUp ? '+' : ''}${diff} Cores`;
-          const desc = `CPU Cores reconfigured: ${prevHw.cpuCores} Cores ➔ ${currCores} Cores (${deltaStr})`;
+          const desc = `CPU Cores reconfigured: ${prevHw.cpuCores} Cores âž” ${currCores} Cores (${deltaStr})`;
           recordHardwareChange({
             serverId: matchedServer.id || targetId,
             serverName: matchedServer.name || targetId,
@@ -3235,7 +3982,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
           const diff = currDiskGB - prevHw.diskTotalGB;
           const isUp = diff > 0;
           const deltaStr = `${isUp ? '+' : ''}${diff} GB`;
-          const desc = `${isUp ? 'Total Storage Expanded (+)' : 'Total Storage Reduced (-)'}: ${prevHw.diskTotalGB} GB ➔ ${currDiskGB} GB (${deltaStr})`;
+          const desc = `${isUp ? 'Total Storage Expanded (+)' : 'Total Storage Reduced (-)'}: ${prevHw.diskTotalGB} GB âž” ${currDiskGB} GB (${deltaStr})`;
           recordHardwareChange({
             serverId: matchedServer.id || targetId,
             serverName: matchedServer.name || targetId,
@@ -3261,7 +4008,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
               const dDiff = curD.totalGB - prevD.totalGB;
               const dUp = dDiff > 0;
               const dDelta = `${dUp ? '+' : ''}${dDiff} GB`;
-              const dDesc = `Drive ${curD.letter}: ${dUp ? 'Space Increased (+)' : 'Space Reduced (-)'}: ${prevD.totalGB} GB ➔ ${curD.totalGB} GB (${dDelta})`;
+              const dDesc = `Drive ${curD.letter}: ${dUp ? 'Space Increased (+)' : 'Space Reduced (-)'}: ${prevD.totalGB} GB âž” ${curD.totalGB} GB (${dDelta})`;
               recordHardwareChange({
                 serverId: matchedServer.id || targetId,
                 serverName: matchedServer.name || targetId,
@@ -3287,7 +4034,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
 
       saveDiskDatabase();
       if (isMysqlConnected && dbPool) {
-        dbPool.query('UPDATE `vps_servers` SET `specs` = ? WHERE `id` = ?', [verifiedSpecs, matchedServer.id]).catch(() => {});
+        safeWrite('vps_servers', () => dbPool.query('UPDATE `vps_servers` SET `specs` = ? WHERE `id` = ?', [verifiedSpecs, matchedServer.id]));
       }
     }
     if (matchedServer.id) allKeys.add(matchedServer.id);
@@ -3328,7 +4075,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
       if (uName && activeSessionUsers.some(an => an && an.toLowerCase().trim() === uName)) {
         user.lastActiveAt = nowIso;
         if (isMysqlConnected && dbPool) {
-          dbPool.query(`UPDATE \`client_subscriptions\` SET \`lastActiveAt\` = ? WHERE \`id\` = ?`, [nowIso, user.id]).catch(() => {});
+          safeWrite('client_subscriptions', () => dbPool.query(`UPDATE \`client_subscriptions\` SET \`lastActiveAt\` = ? WHERE \`id\` = ?`, [nowIso, user.id]));
         }
       }
     }
@@ -3407,7 +4154,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
 
     if (isMysqlConnected && dbPool) {
       try {
-        dbPool.query(
+        safeWrite('user_inactivity_tracker', () => dbPool.query(
           `REPLACE INTO \`user_inactivity_tracker\` (id, serverId, username, company, lastActiveAt, firstDiscoveredAt, daysInactive, isInactiveOver7Days, lastCheckedAt)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
@@ -3421,7 +4168,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
             trackerItem.isInactiveOver7Days,
             trackerItem.lastCheckedAt
           ]
-        ).catch(() => {});
+        ));
       } catch (e) {}
     }
   }
@@ -3468,6 +4215,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
         } catch (e) {}
       }
     }
+    await persistServerMeta(matchedServer);
   }
 
   if (isMysqlConnected && dbPool) {
@@ -3533,7 +4281,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
       }
 
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('server_telemetry_history', () => dbPool.query(
           `INSERT INTO \`server_telemetry_history\` (id, serverId, cpuUsage, ramTotalGB, ramUsedGB, ramPercent, disks, activeUsersCount, disconnectedUsersCount, status, timestamp)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [
@@ -3549,7 +4297,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
             histRecord.status,
             histRecord.timestamp
           ]
-        ).catch(() => {});
+        ));
       }
     }
   } catch (errHist) {
@@ -3564,7 +4312,7 @@ app.post('/api/agent/telemetry', async (req, res) => {
   }
 
   // Check and dispatch pending provisioning jobs for this server node
-  const pendingJobs = getPendingProvisionJobsForServer(targetId, queryTerm, matchedServer?.ipPort);
+  const pendingJobs = filterDeliverableJobs(req, getPendingProvisionJobsForServer(targetId, queryTerm, matchedServer?.ipPort));
 
   res.json({
     success: true,
@@ -3578,17 +4326,14 @@ app.post('/api/agent/telemetry', async (req, res) => {
 // =========================================================================
 // OPTION B: INSTANT PUSH LONG-POLLING LISTENER (0-SECOND EXECUTION PIPE)
 // =========================================================================
-app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], (req, res) => {
+app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], async (req, res) => {
   let targetId = (req.query.serverId || req.body?.serverId || req.headers['x-server-id'] || '').trim();
   const queryTerm = (req.query.queryTerm || '').trim();
 
-  const rawClientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.connection?.remoteAddress || req.ip || '';
-  const clientIp = String(rawClientIp).split(',')[0].trim().replace(/^.*:/, '');
-  if (memoryStore.deletedServers && Array.isArray(memoryStore.deletedServers)) {
-    const isDeleted = memoryStore.deletedServers.some(d => 
-      d === targetId.toLowerCase() || 
-      d === clientIp.toLowerCase()
-    );
+  const rawClientIp = req.clientIp;
+  const clientIp = String(rawClientIp);
+  {
+    const isDeleted = await isServerTermDeleted([targetId, clientIp]);
     if (isDeleted) {
       return res.status(403).json({
         success: false,
@@ -3604,7 +4349,7 @@ app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], (req, res) => {
   if (clientIp && clientIp !== '127.0.0.1') {
     const serverByClientIp = (memoryStore.servers || []).find(s => s.ipPort && s.ipPort.split(':')[0].trim() === clientIp);
     if (serverByClientIp && (!targetId || targetId === 'srv-node-1' || targetId === 'auto' || (targetId.includes(':') && !targetId.startsWith(clientIp)))) {
-      console.log(`⚡ [LISTEN-JOBS AUTO-CORRECTION] IP ${clientIp} requested '${targetId}'. Auto-corrected to '${serverByClientIp.ipPort || serverByClientIp.id}'`);
+      console.log(`âš¡ [LISTEN-JOBS AUTO-CORRECTION] IP ${clientIp} requested '${targetId}'. Auto-corrected to '${serverByClientIp.ipPort || serverByClientIp.id}'`);
       targetId = serverByClientIp.id;
     }
   }
@@ -3620,7 +4365,7 @@ app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], (req, res) => {
   }
 
   // 1. Immediately return any jobs that are already pending right now
-  const immediateJobs = getPendingProvisionJobsForServer(targetId, queryTerm, sIp);
+  const immediateJobs = filterDeliverableJobs(req, getPendingProvisionJobsForServer(targetId, queryTerm, sIp));
   if (immediateJobs && immediateJobs.length > 0) {
     return res.json({
       success: true,
@@ -3650,8 +4395,8 @@ app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], (req, res) => {
     if (newJob && !doesServerMatch(newJob.serverId, targetId)) {
       return;
     }
-    const currentJobs = getPendingProvisionJobsForServer(targetId, queryTerm, sIp);
-    const dispatchJobs = currentJobs.length > 0 ? currentJobs : (newJob ? [newJob] : []);
+    const currentJobs = filterDeliverableJobs(req, getPendingProvisionJobsForServer(targetId, queryTerm, sIp));
+    const dispatchJobs = currentJobs.length > 0 ? currentJobs : (newJob ? filterDeliverableJobs(req, [newJob]) : []);
     if (dispatchJobs.length > 0) {
       sendJobs(dispatchJobs);
     }
@@ -3690,9 +4435,41 @@ app.all(['/api/agent/listen-jobs', '/api/agent/poll-instant'], (req, res) => {
 });
 
 // POST /api/agent/job-result (Reports job completion status from VPS Agent)
-app.post('/api/agent/job-result', async (req, res) => {
+app.post('/api/agent/job-result', jobRouteHandler(async (req, res) => {
   const { serverId, jobId, status, message, details } = req.body;
   if (!jobId) return res.status(400).json({ error: 'Job ID is required' });
+
+  // Task 25.8: a job that was PROCESSING before a restart is not loaded at boot (only PENDING is).
+  // Fall back to MySQL by id so its result is not lost; the row is then completed as usual below.
+  if (!memoryStore.provisionJobs) memoryStore.provisionJobs = [];
+  if (!memoryStore.provisionJobs.some(j => j.id === jobId) && isMysqlConnected && dbPool) {
+    try {
+      const [jr] = await dbPool.query('SELECT * FROM `vps_provision_jobs` WHERE `id` = ? LIMIT 1', [jobId]);
+      const r = jr && jr[0];
+      if (r) {
+        memoryStore.provisionJobs.push({
+          id: r.id,
+          action: r.action || 'PROVISION_TALLY_USER',
+          serverId: r.serverId,
+          companyName: r.companyName || '',
+          username: (r.username || '').replace(/\s+\d+$/, '').trim(),
+          password: r.password || '',
+          newPassword: r.password || '',
+          drive: r.drive || 'D:',
+          sessionId: r.sessionId ? String(r.sessionId) : '',
+          userStatus: r.status === 'DISABLED' ? 'Disabled' : 'Active',
+          enabled: r.status !== 'DISABLED',
+          expiryDate: r.expiryDate || '',
+          setupTSplus: r.setupTSplus === 1,
+          status: r.status,
+          resultMessage: r.resultMessage || '',
+          createdAt: r.createdAt ? new Date(r.createdAt).toISOString() : new Date().toISOString()
+        });
+      }
+    } catch (e) {
+      console.error('[db] job-result lookup failed:', e && (e.code || e.message));
+    }
+  }
 
   if (memoryStore.provisionJobs) {
     const job = memoryStore.provisionJobs.find(j => j.id === jobId);
@@ -3701,6 +4478,8 @@ app.post('/api/agent/job-result', async (req, res) => {
       job.resultMessage = message || '';
       job.completedAt = new Date().toISOString();
       job.details = details || null;
+      // Agent already received the job; clear key/passwords from the memory copy.
+      if (job.status !== 'PENDING') scrubJobSecrets(job);
       saveDiskDatabase();
 
       // Handle Live Screen Capture results
@@ -3719,7 +4498,7 @@ app.post('/api/agent/job-result', async (req, res) => {
 
       // Automatic next-phase relay for 1-Click Client Migration
       if (job.action === 'EXPORT_CLIENT_DATA' && job.migrationId) {
-        const mig = (memoryStore.migrations || []).find(m => m.id === job.migrationId);
+        const mig = await migGet(job.migrationId);
         if (mig) {
           if (status === 'COMPLETED') {
             mig.status = 'BUFFERED';
@@ -3728,40 +4507,42 @@ app.post('/api/agent/job-result', async (req, res) => {
             mig.updatedAt = new Date().toISOString();
             if (details && details.sha256) mig.sha256 = details.sha256;
             if (details && details.fileSizeBytes) mig.fileSizeBytes = details.fileSizeBytes;
-            saveDiskDatabase();
+            await migSave(mig);
 
             // Automatically queue IMPORT_CLIENT_DATA on target server!
             queueServerJob({
               action: 'IMPORT_CLIENT_DATA',
               serverId: mig.targetServerId,
               username: mig.username,
-              password: mig.password || 'Pass#123',
+              password: mig.password
+                || ((memoryStore.users || []).find(u => u.id === mig.clientId)?.password)
+                || generatePassword(),
               companyName: mig.company,
               targetDrive: mig.targetDrive,
               migrationId: mig.id,
               sha256: mig.sha256 || '',
               fileSizeBytes: mig.fileSizeBytes || null,
               tallyVersion: mig.tallyVersion || '',
-              downloadUrl: 'https://vps.innovationwebworks.in/api/agent/migration/download-chunk'
+              downloadUrl: buildPortalUrl(config, '/api/agent/migration/download-chunk')
             });
-            console.log(`🚀 [MIGRATION RELAY] Dispatched IMPORT_CLIENT_DATA for '${mig.username}' to target VPS '${mig.targetServerId}' (Drive: ${mig.targetDrive})`);
+            console.log(`ðŸš€ [MIGRATION RELAY] Dispatched IMPORT_CLIENT_DATA for '${mig.username}' to target VPS '${mig.targetServerId}' (Drive: ${mig.targetDrive})`);
           } else if (status === 'PROCESSING') {
             mig.status = 'EXPORTING';
             mig.step = 1;
             mig.stepMessage = 'Source VPS started data export and compression...';
             mig.updatedAt = new Date().toISOString();
-            saveDiskDatabase();
+            await migSave(mig);
           } else if (status === 'FAILED') {
             mig.status = 'FAILED';
             mig.stepMessage = `Export failed on source VPS: ${message || 'Unknown error'}`;
             mig.updatedAt = new Date().toISOString();
-            saveDiskDatabase();
+            await migSave(mig);
             // Rollback: Re-enable user on source server
             queueToggleUserStatusJob({ serverId: mig.sourceServerId, username: mig.username, status: 'Active', enabled: true });
           }
         }
       } else if (job.action === 'IMPORT_CLIENT_DATA' && job.migrationId) {
-        const mig = (memoryStore.migrations || []).find(m => m.id === job.migrationId);
+        const mig = await migGet(job.migrationId);
         if (mig) {
           if (status === 'COMPLETED') {
             mig.status = 'COMPLETED';
@@ -3779,12 +4560,13 @@ app.post('/api/agent/job-result', async (req, res) => {
               clientUser.isDisabled = false;
               if (isMysqlConnected && dbPool) {
                 dbPool.query(
-                  'UPDATE `clients` SET `serverId` = ?, `drive` = ?, `status` = ?, `isDisabled` = 0 WHERE `id` = ?',
+                  'UPDATE `client_subscriptions` SET `serverId` = ?, `drive` = ?, `status` = ? WHERE `id` = ?',
                   [clientUser.serverId, clientUser.drive, clientUser.status, clientUser.id]
-                ).catch(() => {});
+                ).catch((e) => console.error('[db] client_subscriptions update failed:', e && (e.code || e.message)));
               }
             }
             saveDiskDatabase();
+            await migSave(mig);
 
             // Auto-clean temporary migration files
             const tempBufferZip = path.join(MIGRATIONS_DIR, `${mig.id}.zip`);
@@ -3799,18 +4581,18 @@ app.post('/api/agent/job-result', async (req, res) => {
             if (fs.existsSync(migDir)) {
               try { fs.rmSync(migDir, { recursive: true, force: true }); } catch(e) {}
             }
-            console.log(`✅ [MIGRATION COMPLETE] Client '${mig.username}' successfully migrated to VPS '${mig.targetServerId}' (${clientUser ? clientUser.drive : mig.targetDrive})`);
+            console.log(`âœ… [MIGRATION COMPLETE] Client '${mig.username}' successfully migrated to VPS '${mig.targetServerId}' (${clientUser ? clientUser.drive : mig.targetDrive})`);
           } else if (status === 'PROCESSING') {
             mig.status = 'IMPORTING';
             mig.step = 5;
             mig.stepMessage = 'Target VPS started unpacking data and configuring client...';
             mig.updatedAt = new Date().toISOString();
-            saveDiskDatabase();
+            await migSave(mig);
           } else if (status === 'FAILED') {
             mig.status = 'FAILED';
             mig.stepMessage = `Import failed on target VPS: ${message || 'Unknown error'}`;
             mig.updatedAt = new Date().toISOString();
-            saveDiskDatabase();
+            await migSave(mig);
             // Rollback: Re-enable user on source server
             queueToggleUserStatusJob({ serverId: mig.sourceServerId, username: mig.username, status: 'Active', enabled: true });
           }
@@ -3819,7 +4601,10 @@ app.post('/api/agent/job-result', async (req, res) => {
     }
   }
 
-  if (isMysqlConnected && dbPool) {
+  if (TERMINAL_STATUSES.includes(status || 'COMPLETED')) {
+    // One UPDATE sets status/message and clears password; failures are retried in the background.
+    await finishJob(provisionJobDeps(), jobId, status || 'COMPLETED', message || '');
+  } else if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
         `UPDATE \`vps_provision_jobs\` SET \`status\` = ?, \`resultMessage\` = ?, \`updatedAt\` = CURRENT_TIMESTAMP WHERE \`id\` = ?`,
@@ -3834,11 +4619,11 @@ app.post('/api/agent/job-result', async (req, res) => {
     'PROVISION_JOB_COMPLETED',
     jobId,
     `VPS [${serverId}] executed job ${jobId}: ${status} - ${message || ''}`,
-    req.ip
+    req.clientIp
   );
 
   res.json({ success: true, message: 'Job result logged successfully.' });
-});
+}));
 
 // GET /api/servers/:id/available-drives (Real-time drive allocation & empty finder)
 app.get('/api/servers/:id/available-drives', requireAuth, (req, res) => {
@@ -3914,7 +4699,7 @@ app.get('/api/servers/:id/available-drives', requireAuth, (req, res) => {
 });
 
 // POST /api/servers/:id/initialize-disk (Online, GPT Initialize, Partition Unallocated Space, Format NTFS & Assign Letter)
-app.post('/api/servers/:id/initialize-disk', requireAdmin, async (req, res) => {
+app.post('/api/servers/:id/initialize-disk', requireAdmin, jobRequestGuard, async (req, res) => {
   try {
     const { id } = req.params;
     const { diskNumber, driveLetter, label, sizeGB } = req.body;
@@ -3966,12 +4751,12 @@ app.post('/api/servers/:id/initialize-disk', requireAdmin, async (req, res) => {
       req.employee?.role || 'ADMIN',
       'INITIALIZE_DISK',
       server.name || server.ipPort,
-      `Queued disk volume creation: Disk ${num} ➔ Drive ${cleanLetter}: (Label: ${cleanLabel}, Size: ${parsedSizeGB ? `${parsedSizeGB} GB` : 'All Unallocated'})`
+      `Queued disk volume creation: Disk ${num} âž” Drive ${cleanLetter}: (Label: ${cleanLabel}, Size: ${parsedSizeGB ? `${parsedSizeGB} GB` : 'All Unallocated'})`
     );
 
     res.json({
       success: true,
-      message: `Disk volume provisioning job dispatched: Disk ${num} ➔ Drive ${cleanLetter}: (Label: ${cleanLabel}, Size: ${parsedSizeGB ? `${parsedSizeGB} GB` : 'All Unallocated'})`,
+      message: `Disk volume provisioning job dispatched: Disk ${num} âž” Drive ${cleanLetter}: (Label: ${cleanLabel}, Size: ${parsedSizeGB ? `${parsedSizeGB} GB` : 'All Unallocated'})`,
       jobId: job.id
     });
   } catch (err) {
@@ -3981,7 +4766,7 @@ app.post('/api/servers/:id/initialize-disk', requireAdmin, async (req, res) => {
 });
 
 // POST /api/servers/:id/extend-drive (Resize/Extend Existing NTFS Partition using unallocated space)
-app.post('/api/servers/:id/extend-drive', requireAdmin, async (req, res) => {
+app.post('/api/servers/:id/extend-drive', requireAdmin, jobRequestGuard, async (req, res) => {
   try {
     const { id } = req.params;
     const { diskNumber, driveLetter, sizeGB } = req.body;
@@ -4022,7 +4807,7 @@ app.post('/api/servers/:id/extend-drive', requireAdmin, async (req, res) => {
 });
 
 // POST /api/servers/:id/lockdown-drive (Enforce Zero-Trust NTFS Root Lockdown on Data Drive)
-app.post('/api/servers/:id/lockdown-drive', requireAdmin, async (req, res) => {
+app.post('/api/servers/:id/lockdown-drive', requireAdmin, jobRequestGuard, async (req, res) => {
   try {
     const { id } = req.params;
     const { driveLetter } = req.body;
@@ -4114,6 +4899,109 @@ app.post(['/api/servers/:id/get-agent-log', '/api/servers/:id/agent-log'], requi
   }
 });
 
+// POST /api/clients/export (any authenticated role). Default: rows with NO password column.
+// includePasswords:true requires SUPER_ADMIN and confirm === true; checked before any decrypt.
+// A password-bearing export writes exactly one audit entry (actor, row count; no passwords).
+app.post('/api/clients/export', requireAuth, async (req, res) => {
+  const { serverId, includePasswords, confirm } = req.body || {};
+  const wantPasswords = includePasswords === true;
+  if (wantPasswords && (req.employee?.role !== 'SUPER_ADMIN' || confirm !== true)) {
+    return res.status(403).json({
+      success: false,
+      error: req.employee?.role !== 'SUPER_ADMIN'
+        ? 'Forbidden: SUPER_ADMIN role required'
+        : 'Confirmation required to export passwords'
+    });
+  }
+
+  let list = memoryStore.users || [];
+  if (req.employee?.role === 'SALESPERSON') {
+    const agentName = (req.employee.name || '').toLowerCase();
+    const agentUser = (req.employee.username || '').toLowerCase();
+    list = list.filter(u => u.salesAgent && (u.salesAgent.toLowerCase() === agentName || u.salesAgent.toLowerCase() === agentUser));
+  }
+  if (serverId) list = list.filter(u => u.serverId === serverId);
+
+  const rows = list.map(u => {
+    const row = toPublicClient(u); // strips password / enc:v1: text
+    if (wantPasswords) {
+      let plain = '';
+      try { plain = openPw(u.password) || ''; } catch { plain = ''; }
+      row.password = plain;
+    }
+    return row;
+  });
+
+  if (wantPasswords) {
+    logAudit(
+      req.employee.name || req.employee.username,
+      req.employee.role,
+      'CLIENTS_EXPORTED_WITH_PASSWORDS',
+      serverId || 'ALL',
+      `Exported ${rows.length} client row(s) including passwords`,
+      req.clientIp
+    );
+    res.set('Cache-Control', 'no-store');
+  }
+  return res.json({ success: true, includePasswords: wantPasswords, count: rows.length, clients: rows });
+});
+
+// POST /api/clients/:id/reveal-password (SUPER_ADMIN only; returns the plaintext once, audit entry carries no password)
+app.post('/api/clients/:id/reveal-password', requireAuth, async (req, res) => {
+  // Role check happens before the client lookup and before any decrypt.
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  const client = (memoryStore.users || []).find(u => u.id === req.params.id);
+  if (!client) {
+    return res.status(404).json({ success: false, error: 'Client not found.' });
+  }
+  let plain;
+  try {
+    plain = openPw(client.password);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Password cannot be decrypted.' });
+  }
+  logAudit(
+    req.employee.name || req.employee.username,
+    req.employee.role,
+    'PASSWORD_REVEALED',
+    client.id,
+    `Revealed stored password for client ${client.username || client.id}`,
+    req.clientIp
+  );
+  res.set('Cache-Control', 'no-store');
+  return res.json({ success: true, password: plain });
+});
+
+// POST /api/servers/:id/reveal-password (SUPER_ADMIN only; returns the super-client plaintext once, audit entry carries no password)
+app.post('/api/servers/:id/reveal-password', requireAuth, async (req, res) => {
+  // Role check happens before the server lookup and before any decrypt.
+  if (req.employee?.role !== 'SUPER_ADMIN') {
+    return res.status(403).json({ success: false, error: 'Forbidden: SUPER_ADMIN role required' });
+  }
+  const srv = (memoryStore.servers || []).find(s => s.id === req.params.id);
+  if (!srv) {
+    return res.status(404).json({ success: false, error: 'Server not found.' });
+  }
+  let plain;
+  try {
+    plain = openPw(srv.superClientPass);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Password cannot be decrypted.' });
+  }
+  logAudit(
+    req.employee.name || req.employee.username,
+    req.employee.role,
+    'PASSWORD_REVEALED',
+    srv.id,
+    `Revealed super-client password for server ${srv.name || srv.id}`,
+    req.clientIp
+  );
+  res.set('Cache-Control', 'no-store');
+  return res.json({ success: true, password: plain });
+});
+
 // POST /api/clients/:id/migrate (Initiate 1-Click Client Server Migration)
 app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
   try {
@@ -4150,7 +5038,7 @@ app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
       clientId: client.id,
       username: client.username,
       company: client.company || client.username,
-      password: (client.password && String(client.password).trim()) ? String(client.password).trim() : 'Pass#123',
+      password: sealPw((client.password && String(client.password).trim()) ? String(client.password).trim() : generatePassword()),
       sourceServerId: client.serverId,
       sourceDrive: client.drive || 'Drive D',
       targetServerId: targetServer.id,
@@ -4166,9 +5054,7 @@ app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
       updatedAt: new Date().toISOString()
     };
 
-    if (!memoryStore.migrations) memoryStore.migrations = [];
-    memoryStore.migrations.unshift(migration);
-    saveDiskDatabase();
+    await migCreate(migration);
 
     // Step 1: Queue EXPORT_CLIENT_DATA on Source VPS
     const exportJob = queueServerJob({
@@ -4178,7 +5064,7 @@ app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
       companyName: client.company,
       drive: client.drive,
       migrationId: migrationId,
-      uploadUrl: 'https://vps.innovationwebworks.in/api/agent/migration/upload-chunk'
+      uploadUrl: buildPortalUrl(config, '/api/agent/migration/upload-chunk')
     });
 
     logAudit(
@@ -4187,7 +5073,7 @@ app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
       'CLIENT_MIGRATION_STARTED',
       client.username,
       `Initiated migration of client '${client.company}' from VPS ${client.serverId} to VPS ${targetServer.name} (Drive ${cleanDrive}:)`,
-      req.ip
+      req.clientIp
     );
 
     res.json({
@@ -4203,11 +5089,13 @@ app.post('/api/clients/:id/migrate', requireAuth, async (req, res) => {
 });
 
 // GET /api/migrations/:id/status (Poll Live Migration Progress)
-app.get('/api/migrations/:id/status', requireAuth, (req, res) => {
+app.get('/api/migrations/:id/status', requireAuth, async (req, res) => {
   const { id } = req.params;
-  const mig = (memoryStore.migrations || []).find(m => m.id === id);
+  let mig;
+  try { mig = await migGet(id); }
+  catch (e) { console.error('[Migrations] load failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load migration' }); }
   if (!mig) return res.status(404).json({ success: false, error: 'Migration record not found.' });
-  res.json({ success: true, migration: mig });
+  res.json({ success: true, migration: toPublicMigration(mig) });
 });
 
 // POST /api/migrations/:id/resume-import (Dispatches import phase to target VPS from buffered archive)
@@ -4219,7 +5107,7 @@ app.post('/api/migrations/:id/resume-import', requireAuth, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Migration archive zip does not exist in buffer.' });
     }
 
-    let mig = (memoryStore.migrations || []).find(m => m.id === id);
+    let mig = await migGet(id);
     if (!mig) {
       const clientUser = (memoryStore.users || []).find(u => u.username === 'newtest' || u.company === 'newtest');
       mig = {
@@ -4227,7 +5115,7 @@ app.post('/api/migrations/:id/resume-import', requireAuth, async (req, res) => {
         clientId: clientUser ? clientUser.id : 'u-1792852935048-37979',
         username: clientUser ? clientUser.username : 'newtest',
         company: clientUser ? clientUser.company : 'newtest',
-        password: (clientUser && clientUser.password) ? clientUser.password : 'Pass#123',
+        password: sealPw((clientUser && clientUser.password) ? clientUser.password : generatePassword()),
         sourceServerId: clientUser ? clientUser.serverId : 'vps-1792852800811',
         sourceDrive: clientUser ? clientUser.drive : 'Drive X',
         targetServerId: req.body?.targetServerId || 'vps-1792772863574',
@@ -4236,31 +5124,32 @@ app.post('/api/migrations/:id/resume-import', requireAuth, async (req, res) => {
         sha256: req.body?.sha256 || '31054cd7582602ba0994f8165be62e4cccbc0df38a1741b694ee8cb84f6ca0c8',
         fileSizeBytes: fs.statSync(finalZipPath).size
       };
-      if (!memoryStore.migrations) memoryStore.migrations = [];
-      memoryStore.migrations.unshift(mig);
+      await migCreate(mig);
     }
 
     mig.status = 'BUFFERED';
     mig.step = 3;
     mig.stepMessage = 'Data archive verified in buffer. Dispatching import to target VPS...';
     mig.updatedAt = new Date().toISOString();
-    saveDiskDatabase();
+    await migSave(mig);
 
     const job = queueServerJob({
       action: 'IMPORT_CLIENT_DATA',
       serverId: mig.targetServerId,
       username: mig.username,
-      password: mig.password || (clientUser && clientUser.password) || 'Pass#123',
+      password: mig.password
+        || ((memoryStore.users || []).find(u => u.id === mig.clientId)?.password)
+        || generatePassword(),
       companyName: mig.company,
       targetDrive: mig.targetDrive,
       migrationId: mig.id,
       sha256: mig.sha256 || '',
       fileSizeBytes: mig.fileSizeBytes || (fs.existsSync(finalZipPath) ? fs.statSync(finalZipPath).size : null),
       tallyVersion: mig.tallyVersion || '',
-      downloadUrl: 'https://vps.innovationwebworks.in/api/agent/migration/download-chunk'
+      downloadUrl: buildPortalUrl(config, '/api/agent/migration/download-chunk')
     });
 
-    console.log(`🚀 [MIGRATION RELAY] Dispatched IMPORT_CLIENT_DATA for '${mig.username}' to target VPS '${mig.targetServerId}' (Drive: ${mig.targetDrive})`);
+    console.log(`ðŸš€ [MIGRATION RELAY] Dispatched IMPORT_CLIENT_DATA for '${mig.username}' to target VPS '${mig.targetServerId}' (Drive: ${mig.targetDrive})`);
     res.json({ success: true, message: 'IMPORT_CLIENT_DATA dispatched to target VPS successfully.', jobId: job.id });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -4268,18 +5157,20 @@ app.post('/api/migrations/:id/resume-import', requireAuth, async (req, res) => {
 });
 
 // GET /api/migrations (List Recent Migrations)
-app.get('/api/migrations', requireAuth, (req, res) => {
-  res.json({ success: true, migrations: (memoryStore.migrations || []).slice(0, 50) });
+app.get('/api/migrations', requireAuth, async (req, res) => {
+  let list;
+  try { list = await migList(); }
+  catch (e) { console.error('[Migrations] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load migrations' }); }
+  res.json({ success: true, migrations: list.slice(0, 50).map(toPublicMigration) });
 });
 
 // DELETE /api/migrations/:id (Delete single migration record from ledger & clean temp files)
-app.delete('/api/migrations/:id', requireAuth, (req, res) => {
+app.delete('/api/migrations/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   if (!id) return res.status(400).json({ success: false, error: 'Migration ID is required' });
 
-  const beforeLen = (memoryStore.migrations || []).length;
-  memoryStore.migrations = (memoryStore.migrations || []).filter(m => m.id !== id);
-  saveDiskDatabase();
+  try { await migRemove(id); }
+  catch (e) { console.error('[Migrations] delete failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to delete migration' }); }
 
   // Clean any temporary buffer files
   const tempZip = path.join(MIGRATIONS_DIR, `${id}.zip`);
@@ -4293,12 +5184,14 @@ app.delete('/api/migrations/:id', requireAuth, (req, res) => {
 });
 
 // DELETE /api/migrations (Clear all finished/failed migrations from ledger)
-app.delete('/api/migrations', requireAuth, (req, res) => {
-  const beforeCount = (memoryStore.migrations || []).length;
-  // Keep only active in-transit migrations
-  memoryStore.migrations = (memoryStore.migrations || []).filter(m => m.status !== 'COMPLETED' && m.status !== 'FAILED' && m.status !== 'ROLLED_BACK');
-  saveDiskDatabase();
-  const deletedCount = beforeCount - (memoryStore.migrations || []).length;
+app.delete('/api/migrations', requireAuth, async (req, res) => {
+  let deletedCount = 0;
+  try {
+    // Keep only active in-transit migrations
+    const finished = (await migList()).filter(m => m.status === 'COMPLETED' || m.status === 'FAILED' || m.status === 'ROLLED_BACK');
+    for (const m of finished) await migRemove(m.id);
+    deletedCount = finished.length;
+  } catch (e) { console.error('[Migrations] clear failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to clear migrations' }); }
 
   res.json({ success: true, message: `Cleared ${deletedCount} finished migration record(s).`, deletedCount });
 });
@@ -4307,7 +5200,7 @@ app.delete('/api/migrations', requireAuth, (req, res) => {
 app.post('/api/migrations/:id/rollback', requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const mig = (memoryStore.migrations || []).find(m => m.id === id);
+    const mig = await migGet(id);
     if (!mig) {
       return res.status(404).json({ success: false, error: 'Migration record not found.' });
     }
@@ -4322,9 +5215,9 @@ app.post('/api/migrations/:id/rollback', requireAuth, async (req, res) => {
 
       if (isMysqlConnected && dbPool) {
         dbPool.query(
-          'UPDATE `clients` SET `serverId` = ?, `drive` = ?, `status` = ?, `isDisabled` = 0 WHERE `id` = ?',
+          'UPDATE `client_subscriptions` SET `serverId` = ?, `drive` = ?, `status` = ? WHERE `id` = ?',
           [clientUser.serverId, clientUser.drive, clientUser.status, clientUser.id]
-        ).catch(() => {});
+        ).catch((e) => console.error('[db] client_subscriptions update failed:', e && (e.code || e.message)));
       }
     }
 
@@ -4350,7 +5243,7 @@ app.post('/api/migrations/:id/rollback', requireAuth, async (req, res) => {
     mig.status = 'ROLLED_BACK';
     mig.stepMessage = `Migration rolled back. Client restored to Source VPS (${mig.sourceServerId}) on ${mig.sourceDrive}. Target VPS cleaned.`;
     mig.updatedAt = new Date().toISOString();
-    saveDiskDatabase();
+    await migSave(mig);
 
     logAudit(
       req.employee?.name || 'Admin',
@@ -4358,13 +5251,13 @@ app.post('/api/migrations/:id/rollback', requireAuth, async (req, res) => {
       'CLIENT_MIGRATION_ROLLED_BACK',
       mig.username,
       `Rolled back migration ${mig.id}. Restored '${mig.company}' to VPS ${mig.sourceServerId} (${mig.sourceDrive}) and cleaned target VPS ${mig.targetServerId}`,
-      req.ip
+      req.clientIp
     );
 
     res.json({
       success: true,
       message: `Client '${mig.company}' successfully restored to Source VPS (${mig.sourceServerId}) on ${mig.sourceDrive}. Target VPS clean-up job dispatched.`,
-      client: clientUser
+      client: toPublicClient(clientUser)
     });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -4388,11 +5281,12 @@ app.post('/api/clients/:id/reset-server', requireAdmin, async (req, res) => {
     saveDiskDatabase();
 
     if (isMysqlConnected && dbPool) {
-      dbPool.query('UPDATE `clients` SET `serverId` = ?, `drive` = ?, `status` = ?, `isDisabled` = 0 WHERE `id` = ?',
-        [clientUser.serverId, clientUser.drive, clientUser.status, clientUser.id]).catch(() => {});
+      dbPool.query('UPDATE `client_subscriptions` SET `serverId` = ?, `drive` = ?, `status` = ? WHERE `id` = ?',
+        [clientUser.serverId, clientUser.drive, clientUser.status, clientUser.id])
+        .catch((e) => console.error('[db] client_subscriptions update failed:', e && (e.code || e.message)));
     }
 
-    res.json({ success: true, message: `Client '${clientUser.company}' mapped to ${serverId} (${clientUser.drive}).`, client: clientUser });
+    res.json({ success: true, message: `Client '${clientUser.company}' mapped to ${serverId} (${clientUser.drive}).`, client: toPublicClient(clientUser) });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -4423,9 +5317,9 @@ app.post('/api/servers/:id/cleanup-client', requireAdmin, async (req, res) => {
 // Mutex to serialize chunk assembly across concurrent multi-worker uploads
 const activeAssemblies = new Set();
 
-// POST /api/agent/migration/upload-full  (single streaming upload — entire zip in one connection)
-// NO body parser middleware — we stream directly to disk to avoid memory buffering large files
-app.post('/api/agent/migration/upload-full', (req, res) => {
+// POST /api/agent/migration/upload-full  (single streaming upload â€” entire zip in one connection)
+// NO body parser middleware â€” we stream directly to disk to avoid memory buffering large files
+app.post('/api/agent/migration/upload-full', async (req, res) => {
   try {
     const rawMigrationId = String(req.query.migrationId  || '').trim();
     const migrationId    = rawMigrationId.replace(/[^a-zA-Z0-9_-]/g, '');
@@ -4440,7 +5334,7 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
 
     const tempPath    = path.resolve(MIGRATIONS_DIR, `${migrationId}.uploading`);
     const finalZipPath = path.resolve(MIGRATIONS_DIR, `${migrationId}.zip`);
-    if (!tempPath.startsWith(path.resolve(MIGRATIONS_DIR)) || !finalZipPath.startsWith(path.resolve(MIGRATIONS_DIR))) {
+    if (!tempPath.startsWith(path.resolve(MIGRATIONS_DIR) + path.sep) || !finalZipPath.startsWith(path.resolve(MIGRATIONS_DIR) + path.sep)) {
       return res.status(403).json({ success: false, error: 'Access denied: Directory traversal detected' });
     }
 
@@ -4454,13 +5348,14 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
     const uploadStart   = Date.now();
 
     // Update migration status to TRANSFERRING
-    const mig = (memoryStore.migrations || []).find(m => m.id === migrationId);
+    const mig = await migGet(migrationId);
     if (mig) {
       mig.step        = 2;
       mig.status      = 'TRANSFERRING';
       mig.transferStartAt = uploadStart;
       mig.stepMessage = 'Streaming ZIP to portal buffer...';
       mig.updatedAt   = new Date().toISOString();
+      await migSave(mig);
     }
 
     req.on('data', chunk => {
@@ -4475,10 +5370,10 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
         const pct        = declaredSize > 0 ? Math.round((bytesReceived / declaredSize) * 100) : '?';
         if (mig) {
           mig.transferSpeedMBps = parseFloat(speedMBps);
-          mig.stepMessage = `Receiving upload — ${(bytesReceived / (1024 * 1024)).toFixed(0)} MB / ${(declaredSize / (1024 * 1024)).toFixed(0)} MB (${pct}%) @ ${speedMBps} MB/s`;
+          mig.stepMessage = `Receiving upload â€” ${(bytesReceived / (1024 * 1024)).toFixed(0)} MB / ${(declaredSize / (1024 * 1024)).toFixed(0)} MB (${pct}%) @ ${speedMBps} MB/s`;
           mig.updatedAt = new Date().toISOString();
         }
-        console.log(`📤 [MIG UPLOAD] ${migrationId}: ${(bytesReceived/1024/1024).toFixed(0)} MB received @ ${speedMBps} MB/s`);
+        console.log(`ðŸ“¤ [MIG UPLOAD] ${migrationId}: ${(bytesReceived/1024/1024).toFixed(0)} MB received @ ${speedMBps} MB/s`);
       }
     });
 
@@ -4488,10 +5383,10 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
       const computedSha = hash.digest('hex').toLowerCase();
 
       if (expectedSha && computedSha !== expectedSha) {
-        console.error(`❌ [MIG SHA MISMATCH] ${migrationId}: expected ${expectedSha}, got ${computedSha}`);
+        console.error(`âŒ [MIG SHA MISMATCH] ${migrationId}: expected ${expectedSha}, got ${computedSha}`);
         try { fs.unlinkSync(tempPath); } catch(e) {}
-        if (mig) { mig.status = 'FAILED'; mig.stepMessage = `SHA-256 mismatch! Transfer corrupted.`; saveDiskDatabase(); }
-        return res.status(400).json({ success: false, error: 'SHA-256 mismatch — archive corrupted in transit' });
+        if (mig) { mig.status = 'FAILED'; mig.stepMessage = `SHA-256 mismatch! Transfer corrupted.`; migSaveQuiet(mig); }
+        return res.status(400).json({ success: false, error: 'SHA-256 mismatch â€” archive corrupted in transit' });
       }
 
       // Atomically promote to final path
@@ -4501,7 +5396,7 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
       const stat       = fs.statSync(finalZipPath);
       const elapsedSec = Math.max(1, (Date.now() - uploadStart) / 1000);
       const avgSpeed   = (stat.size / (1024 * 1024) / elapsedSec).toFixed(1);
-      console.log(`📦 [MIG UPLOAD] ${migrationId}: ${(stat.size/1024/1024).toFixed(1)} MB verified in ${elapsedSec.toFixed(0)}s @ avg ${avgSpeed} MB/s`);
+      console.log(`ðŸ“¦ [MIG UPLOAD] ${migrationId}: ${(stat.size/1024/1024).toFixed(1)} MB verified in ${elapsedSec.toFixed(0)}s @ avg ${avgSpeed} MB/s`);
 
       if (mig) {
         mig.status       = 'BUFFERED';
@@ -4510,23 +5405,23 @@ app.post('/api/agent/migration/upload-full', (req, res) => {
         mig.fileSizeBytes = stat.size;
         mig.stepMessage  = `Archive received & verified (${(stat.size / (1024 * 1024)).toFixed(1)} MB). Ready for target extraction.`;
         mig.updatedAt    = new Date().toISOString();
-        saveDiskDatabase();
+        migSaveQuiet(mig);
       }
 
       res.json({ success: true, migrationId, sha256: computedSha, fileSizeBytes: stat.size });
     });
 
     writeStream.on('error', err => {
-      console.error(`❌ [MIG UPLOAD] Write error for ${migrationId}:`, err.message);
+      console.error(`âŒ [MIG UPLOAD] Write error for ${migrationId}:`, err.message);
       try { fs.unlinkSync(tempPath); } catch(e) {}
       if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
     });
 
     req.on('error', err => {
-      console.error(`❌ [MIG UPLOAD] Request stream error for ${migrationId}:`, err.message);
+      console.error(`âŒ [MIG UPLOAD] Request stream error for ${migrationId}:`, err.message);
       writeStream.destroy();
       try { fs.unlinkSync(tempPath); } catch(e) {}
-      if (mig) { mig.status = 'FAILED'; mig.stepMessage = `Upload stream interrupted: ${err.message}`; saveDiskDatabase(); }
+      if (mig) { mig.status = 'FAILED'; mig.stepMessage = `Upload stream interrupted: ${err.message}`; migSaveQuiet(mig); }
     });
 
   } catch (err) {
@@ -4554,13 +5449,13 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
     if (chunkSha) {
       const receivedChunkSha = crypto.createHash('sha256').update(req.body).digest('hex').toLowerCase();
       if (receivedChunkSha !== chunkSha) {
-        console.error(`❌ [CHUNK SHA MISMATCH] Migration ${migrationId} Chunk ${chunkIndex}: Expected ${chunkSha}, Got ${receivedChunkSha}`);
+        console.error(`âŒ [CHUNK SHA MISMATCH] Migration ${migrationId} Chunk ${chunkIndex}: Expected ${chunkSha}, Got ${receivedChunkSha}`);
         return res.status(400).json({ success: false, error: `Chunk ${chunkIndex} SHA-256 mismatch in transit` });
       }
     }
 
     const migChunksDir = path.resolve(MIGRATIONS_DIR, migrationId);
-    if (!migChunksDir.startsWith(path.resolve(MIGRATIONS_DIR))) {
+    if (!migChunksDir.startsWith(path.resolve(MIGRATIONS_DIR) + path.sep)) {
       return res.status(403).json({ success: false, error: 'Access denied: Directory traversal detected' });
     }
     if (!fs.existsSync(migChunksDir)) {
@@ -4576,7 +5471,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
     const partIndices = new Set(existingParts.map(f => parseInt(f.replace('chunk_', '').replace('.part', ''), 10)));
     const receivedCount = partIndices.size;
 
-    const mig = (memoryStore.migrations || []).find(m => m.id === migrationId);
+    const mig = await migGet(migrationId);
     if (mig) {
       mig.step = 2;
       mig.status = 'TRANSFERRING';
@@ -4589,8 +5484,9 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
       mig.transferSpeedMBps = parseFloat(speedMBps);
       mig.chunksReceived = receivedCount;
       mig.chunksTotal = totalChunks;
-      mig.stepMessage = `Uploading to buffer — ${receivedCount}/${totalChunks} chunks (${Math.round((receivedCount / totalChunks) * 100)}%) @ ${speedMBps} MB/s`;
+      mig.stepMessage = `Uploading to buffer â€” ${receivedCount}/${totalChunks} chunks (${Math.round((receivedCount / totalChunks) * 100)}%) @ ${speedMBps} MB/s`;
       mig.updatedAt = new Date().toISOString();
+      await migSave(mig);
     }
 
     // Check if all chunks 0..(totalChunks - 1) are present
@@ -4614,7 +5510,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
 
       // If another parallel worker is currently assembling this archive, await completion
       if (activeAssemblies.has(migrationId)) {
-        console.log(`⏳ [MIGRATION BUFFER] Assembly already active for ${migrationId}, waiting...`);
+        console.log(`â³ [MIGRATION BUFFER] Assembly already active for ${migrationId}, waiting...`);
         let waitSec = 0;
         while (activeAssemblies.has(migrationId) && waitSec < 120) {
           await new Promise(r => setTimeout(r, 500));
@@ -4636,7 +5532,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
           try { fs.unlinkSync(tempAssemblyPath); } catch (e) {}
         }
 
-        console.log(`🔧 [MIGRATION BUFFER] Assembling ${totalChunks} chunks for ${migrationId}...`);
+        console.log(`ðŸ”§ [MIGRATION BUFFER] Assembling ${totalChunks} chunks for ${migrationId}...`);
         const outStream = fs.createWriteStream(tempAssemblyPath);
 
         for (let i = 0; i < totalChunks; i++) {
@@ -4663,11 +5559,11 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
         const computedSha = hash.digest('hex').toLowerCase();
 
         if (expectedSha && computedSha !== expectedSha) {
-          console.error(`❌ [MIGRATION SHA MISMATCH] Expected ${expectedSha}, Got ${computedSha}`);
+          console.error(`âŒ [MIGRATION SHA MISMATCH] Expected ${expectedSha}, Got ${computedSha}`);
           if (mig) {
             mig.status = 'FAILED';
             mig.stepMessage = `SHA-256 verification failed in transit! Expected: ${expectedSha}, Received: ${computedSha}`;
-            saveDiskDatabase();
+            await migSave(mig);
           }
           try { fs.unlinkSync(tempAssemblyPath); } catch (e) {}
           return res.status(400).json({ success: false, error: 'Full archive SHA-256 mismatch' });
@@ -4691,7 +5587,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
         }
 
         const stat = fs.statSync(finalZipPath);
-        console.log(`📦 [MIGRATION BUFFER] Assembled & verified ${migrationId}.zip (${stat.size} bytes, SHA-256: ${computedSha})`);
+        console.log(`ðŸ“¦ [MIGRATION BUFFER] Assembled & verified ${migrationId}.zip (${stat.size} bytes, SHA-256: ${computedSha})`);
 
         if (mig) {
           mig.status = 'BUFFERED';
@@ -4699,7 +5595,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
           mig.sha256 = computedSha;
           mig.fileSizeBytes = stat.size;
           mig.stepMessage = `Data archive verified in buffer (${(stat.size / (1024 * 1024)).toFixed(1)} MB). Ready for target download.`;
-          saveDiskDatabase();
+          await migSave(mig);
         }
 
         return res.json({ success: true, migrationId, chunkIndex, totalChunks, isComplete: true, sha256: computedSha });
@@ -4716,7 +5612,7 @@ app.post('/api/agent/migration/upload-chunk', express.raw({ type: '*/*', limit: 
 });
 
 // GET /api/agent/migration/download-chunk (Target VPS downloads the verified zip or chunk)
-app.get('/api/agent/migration/download-chunk', (req, res) => {
+app.get('/api/agent/migration/download-chunk', async (req, res) => {
   const rawMigrationId = String(req.query.migrationId || '').trim();
   const migrationId    = rawMigrationId.replace(/[^a-zA-Z0-9_-]/g, '');
   const chunkIndex = req.query.chunkIndex !== undefined && req.query.chunkIndex !== '' ? parseInt(req.query.chunkIndex, 10) : null;
@@ -4727,7 +5623,7 @@ app.get('/api/agent/migration/download-chunk', (req, res) => {
   // Direct chunk download support
   if (chunkIndex !== null && !isNaN(chunkIndex)) {
     const chunkFile = path.resolve(MIGRATIONS_DIR, migrationId, `part_${chunkIndex}.chk`);
-    if (!chunkFile.startsWith(path.resolve(MIGRATIONS_DIR))) {
+    if (!chunkFile.startsWith(path.resolve(MIGRATIONS_DIR) + path.sep)) {
       return res.status(403).json({ success: false, error: 'Access denied: Directory traversal detected' });
     }
     if (fs.existsSync(chunkFile)) {
@@ -4736,20 +5632,21 @@ app.get('/api/agent/migration/download-chunk', (req, res) => {
   }
 
   const finalZipPath = path.resolve(MIGRATIONS_DIR, `${migrationId}.zip`);
-  if (!finalZipPath.startsWith(path.resolve(MIGRATIONS_DIR))) {
+  if (!finalZipPath.startsWith(path.resolve(MIGRATIONS_DIR) + path.sep)) {
     return res.status(403).json({ success: false, error: 'Access denied: Directory traversal detected' });
   }
   if (!fs.existsSync(finalZipPath)) {
     return res.status(404).json({ success: false, error: 'Migration archive not found or already purged' });
   }
 
-  const mig = (memoryStore.migrations || []).find(m => m.id === migrationId);
+  let mig = null;
+  try { mig = await migGet(migrationId); } catch (e) { console.error('[Migrations] load failed:', e.message); }
   if (mig && mig.status !== 'EXTRACTING') {
     mig.step = 4;
     mig.status = 'EXTRACTING';
     mig.stepMessage = 'Target VPS is downloading and extracting data archive...';
     mig.updatedAt = new Date().toISOString();
-    saveDiskDatabase();
+    migSaveQuiet(mig);
   }
 
   // Support HTTP Range requests for parallel multi-stream downloads
@@ -4798,7 +5695,7 @@ app.post('/api/servers/:id/optimize', requireAdmin, async (req, res) => {
       'SERVER_OPTIMIZE_TRIGGERED',
       server.name || server.ipPort,
       `Dispatched manual server optimization & cleanup job for ${server.name}`,
-      req.ip
+      req.clientIp
     );
 
     res.json({
@@ -4837,8 +5734,10 @@ app.get('/api/servers/hardware-history', requireAuth, async (req, res) => {
       }
       query += ' ORDER BY `detectedAt` DESC LIMIT 200';
       const [rows] = await dbPool.query(query, params);
-      if (rows && rows.length > 0) history = rows;
-    } catch (e) {}
+      history = Array.isArray(rows) ? rows : []; // MySQL is authoritative when reachable
+    } catch (e) {
+      console.error('[db] hardware-history read failed, using memory fallback:', e && (e.code || e.message));
+    }
   }
   if (serverIdFilter && history.length > 0) {
     history = history.filter(h => h.serverId === serverIdFilter || (h.serverIp && h.serverIp.includes(serverIdFilter)));
@@ -4856,8 +5755,10 @@ app.get('/api/servers/:id/hardware-history', requireAuth, async (req, res) => {
         'SELECT * FROM `vps_hardware_history` WHERE `serverId` = ? OR `serverIp` LIKE ? ORDER BY `detectedAt` DESC LIMIT 100',
         [id, `%${id}%`]
       );
-      if (rows && rows.length > 0) history = rows;
-    } catch (e) {}
+      history = Array.isArray(rows) ? rows : []; // MySQL is authoritative when reachable
+    } catch (e) {
+      console.error('[db] server hardware-history read failed, using memory fallback:', e && (e.code || e.message));
+    }
   }
   res.json({ success: true, serverId: id, history });
 });
@@ -4907,6 +5808,7 @@ app.get('/api/servers/:id/telemetry-history', requireAuth, async (req, res) => {
   }
 
   let dbPoints = [];
+  let dbQueryOk = false;
   if (isMysqlConnected && dbPool) {
     try {
       const [allRows] = await dbPool.query(
@@ -4915,6 +5817,7 @@ app.get('/api/servers/:id/telemetry-history', requireAuth, async (req, res) => {
          ORDER BY createdAt ASC`,
         [targetId]
       );
+      dbQueryOk = true;
       let rows = allRows;
       if (Array.isArray(allRows) && allRows.length > 300) {
         // Downsample evenly across the time range from oldest to newest
@@ -4964,7 +5867,9 @@ app.get('/api/servers/:id/telemetry-history', requireAuth, async (req, res) => {
           };
         });
       }
-    } catch (e) {}
+    } catch (e) {
+      console.error('[db] telemetry-history read failed, using memory fallback:', e && (e.code || e.message));
+    }
   }
 
   // Authentic Telemetry Points: DB history > Memory Store history > Live snapshot
@@ -4972,7 +5877,7 @@ app.get('/api/servers/:id/telemetry-history', requireAuth, async (req, res) => {
 
   if (dbPoints && dbPoints.length > 0) {
     finalPoints = dbPoints;
-  } else if (memoryStore.telemetryHistory && Array.isArray(memoryStore.telemetryHistory[targetId]) && memoryStore.telemetryHistory[targetId].length > 0) {
+  } else if (!dbQueryOk && memoryStore.telemetryHistory && Array.isArray(memoryStore.telemetryHistory[targetId]) && memoryStore.telemetryHistory[targetId].length > 0) {
     let cutoffMs = Date.now() - 24 * 60 * 60 * 1000;
     if (range === '1h') cutoffMs = Date.now() - 60 * 60 * 1000;
     else if (range === '3h') cutoffMs = Date.now() - 3 * 60 * 60 * 1000;
@@ -5176,9 +6081,9 @@ app.get('/api/servers/:id/report', requireAuth, async (req, res) => {
   res.json({
     success: true,
     report: {
-      server: matchedServer,
+      server: toPublicServer(matchedServer),
       telemetry: liveTele,
-      assignedUsers,
+      assignedUsers: assignedUsers.map(toPublicClient),
       generatedAt: new Date().toISOString(),
       timeRange: range
     }
@@ -5361,7 +6266,7 @@ app.get('/api/servers/:serverId/os-users', requireAuth, async (req, res) => {
 });
 
 // POST /api/servers/:serverId/change-user-status & /toggle-user-status (Direct Alias)
-app.post(['/api/servers/:serverId/change-user-status', '/api/servers/:serverId/toggle-user-status'], requireAuth, async (req, res) => {
+app.post(['/api/servers/:serverId/change-user-status', '/api/servers/:serverId/toggle-user-status'], requireAuth, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId } = req.params;
   const { username, user, enable, enabled, status } = req.body;
   const rawUsername = username || user || '';
@@ -5394,7 +6299,7 @@ app.post(['/api/servers/:serverId/change-user-status', '/api/servers/:serverId/t
     'OS_USER_TOGGLE_STATUS',
     targetUsername,
     `Account status toggle (${isEnabled ? 'ENABLE' : 'DISABLE'}) queued for '${targetUsername}' on VPS (${matchedServer?.name || targetId}). Job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -5405,10 +6310,10 @@ app.post(['/api/servers/:serverId/change-user-status', '/api/servers/:serverId/t
     jobId: job.id,
     message: `Account '${targetUsername}' status update queued (${isEnabled ? 'Enabled' : 'Disabled'}).`
   });
-});
+}));
 
 // POST /api/servers/:serverId/os-users/:username/toggle-status
-app.post('/api/servers/:serverId/os-users/:username/toggle-status', requireAuth, async (req, res) => {
+app.post('/api/servers/:serverId/os-users/:username/toggle-status', requireAuth, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId, username } = req.params;
   const { status, enabled } = req.body;
 
@@ -5471,7 +6376,7 @@ app.post('/api/servers/:serverId/os-users/:username/toggle-status', requireAuth,
     matchedClient.status = isEnabled ? 'ACTIVE' : 'DISABLED';
     saveDiskDatabase();
     if (isMysqlConnected && dbPool) {
-      dbPool.query(`UPDATE \`client_subscriptions\` SET \`status\` = ? WHERE \`id\` = ?`, [matchedClient.status, matchedClient.id]).catch(() => {});
+      safeWrite('client_subscriptions', () => dbPool.query(`UPDATE \`client_subscriptions\` SET \`status\` = ? WHERE \`id\` = ?`, [matchedClient.status, matchedClient.id]));
     }
   }
 
@@ -5481,7 +6386,7 @@ app.post('/api/servers/:serverId/os-users/:username/toggle-status', requireAuth,
     isEnabled ? 'OS_USER_ENABLED' : 'OS_USER_DISABLED',
     targetUsername,
     `Windows user account '${targetUsername}' set to ${newStatus} on VPS (${matchedServer?.name || targetId}). Job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -5493,10 +6398,10 @@ app.post('/api/servers/:serverId/os-users/:username/toggle-status', requireAuth,
     jobId: job.id,
     message: `User '${targetUsername}' ${isEnabled ? 'enabled' : 'disabled'} successfully on Windows VPS.`
   });
-});
+}));
 
 // POST /api/servers/:serverId/os-users/:username/change-password
-app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdmin, async (req, res) => {
+app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdmin, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId, username } = req.params;
   const { newPassword } = req.body;
 
@@ -5511,11 +6416,18 @@ app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdm
   );
   const targetId = matchedServer ? matchedServer.id : serverId;
 
+  let sealedNewPassword;
+  try {
+    sealedNewPassword = sealPw(newPassword.trim());
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the password' });
+  }
+
   // 1. Dispatch remote password sync job to Windows VPS node
   const job = queuePasswordChangeJob({
     serverId: targetId,
     username: targetUsername,
-    newPassword: newPassword.trim()
+    newPassword: sealedNewPassword
   });
 
   // 2. If user is in client_subscriptions, sync password
@@ -5524,13 +6436,13 @@ app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdm
     (u.serverId === targetId || u.serverId === matchedServer?.ipPort)
   );
   if (matchedClient) {
-    matchedClient.password = newPassword.trim();
+    matchedClient.password = sealedNewPassword;
     saveDiskDatabase();
     if (isMysqlConnected && dbPool) {
-      dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE \`id\` = ?`, [newPassword.trim(), matchedClient.id]).catch(() => {});
+      safeWrite('client_subscriptions', () => dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE \`id\` = ?`, [sealedNewPassword, matchedClient.id]));
     }
   } else if (isMysqlConnected && dbPool) {
-    dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE LOWER(\`username\`) = ?`, [newPassword.trim(), targetUsername.toLowerCase()]).catch(() => {});
+    safeWrite('client_subscriptions', () => dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE LOWER(\`username\`) = ?`, [sealedNewPassword, targetUsername.toLowerCase()]));
   }
 
   logAudit(
@@ -5539,7 +6451,7 @@ app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdm
     'OS_USER_PASSWORD_CHANGE',
     targetUsername,
     `Password updated for Windows user '${targetUsername}' on VPS (${matchedServer?.name || targetId}). Job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -5549,10 +6461,10 @@ app.post('/api/servers/:serverId/os-users/:username/change-password', requireAdm
     jobId: job.id,
     message: `Password update queued for user '${targetUsername}'. Windows VPS will sync in seconds.`
   });
-});
+}));
 
 // POST /api/servers/:serverId/os-users/:username/logoff
-app.post('/api/servers/:serverId/os-users/:username/logoff', requireAuth, async (req, res) => {
+app.post('/api/servers/:serverId/os-users/:username/logoff', requireAuth, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId, username } = req.params;
   const { sessionId } = req.body;
 
@@ -5603,7 +6515,7 @@ app.post('/api/servers/:serverId/os-users/:username/logoff', requireAuth, async 
     'OS_USER_LOGOFF',
     targetUsername,
     `Logoff dispatched for user '${targetUsername}' (Session: ${targetSessionId || 'Auto-Detect'}) on VPS (${matchedServer?.name || targetId}). Job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -5614,7 +6526,7 @@ app.post('/api/servers/:serverId/os-users/:username/logoff', requireAuth, async 
     jobId: job.id,
     message: `Session termination dispatched for user '${targetUsername}'. Logoff will take effect immediately.`
   });
-});
+}));
 
 // GET /api/reports/inactive-users (Requires Auth - Persistent Inactivity Query)
 app.get('/api/reports/inactive-users', requireAuth, async (req, res) => {
@@ -5847,15 +6759,15 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
       memoryStore.monitoringAlerts.push(alertObj);
     }
     if (isMysqlConnected && dbPool) {
-      dbPool.query(
+      safeWrite('server_monitoring_alerts', () => dbPool.query(
         `REPLACE INTO \`server_monitoring_alerts\` (id, serverId, alertType, target, message, severity, status, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         [alertObj.id, alertObj.serverId, alertObj.alertType, alertObj.target, alertObj.message, alertObj.severity, alertObj.status, alertObj.updatedAt]
-      ).catch(() => {});
+      ));
     }
   } else if (existingRamAlertIndex >= 0) {
     memoryStore.monitoringAlerts[existingRamAlertIndex].status = 'RESOLVED';
     if (isMysqlConnected && dbPool) {
-      dbPool.query(`UPDATE \`server_monitoring_alerts\` SET status = 'RESOLVED' WHERE id = ?`, [memoryStore.monitoringAlerts[existingRamAlertIndex].id]).catch(() => {});
+      safeWrite('server_monitoring_alerts', () => dbPool.query(`UPDATE \`server_monitoring_alerts\` SET status = 'RESOLVED' WHERE id = ?`, [memoryStore.monitoringAlerts[existingRamAlertIndex].id]));
     }
   }
 
@@ -5894,15 +6806,15 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
         memoryStore.monitoringAlerts.push(alertObj);
       }
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('server_monitoring_alerts', () => dbPool.query(
           `REPLACE INTO \`server_monitoring_alerts\` (id, serverId, alertType, target, message, severity, status, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [alertObj.id, alertObj.serverId, alertObj.alertType, alertObj.target, alertObj.message, alertObj.severity, alertObj.status, alertObj.updatedAt]
-        ).catch(() => {});
+        ));
       }
     } else if (existingDiskAlertIndex >= 0) {
       memoryStore.monitoringAlerts[existingDiskAlertIndex].status = 'RESOLVED';
       if (isMysqlConnected && dbPool) {
-        dbPool.query(`UPDATE \`server_monitoring_alerts\` SET status = 'RESOLVED' WHERE id = ?`, [alertId]).catch(() => {});
+        safeWrite('server_monitoring_alerts', () => dbPool.query(`UPDATE \`server_monitoring_alerts\` SET status = 'RESOLVED' WHERE id = ?`, [alertId]));
       }
     }
   }
@@ -5961,10 +6873,10 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
       }
 
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('daily_user_activity', () => dbPool.query(
           `REPLACE INTO \`daily_user_activity\` (id, serverId, username, activityDate, firstLogin, lastLogout, sessionCount, totalUsageSeconds, currentStatus, lastUpdated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [dailyItem.id, dailyItem.serverId, dailyItem.username, dailyItem.activityDate, dailyItem.firstLogin, dailyItem.lastLogout, dailyItem.sessionCount, dailyItem.totalUsageSeconds, dailyItem.currentStatus, dailyItem.lastUpdated]
-        ).catch(() => {});
+        ));
       }
     } else {
       // User is CONTINUOUSLY ONLINE in the SAME ongoing session
@@ -5999,10 +6911,10 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
       memoryStore.sessionEvents.unshift(evtObj);
 
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('server_session_events', () => dbPool.query(
           `REPLACE INTO \`server_session_events\` (id, serverId, username, sessionId, eventState, loginTime, logoutTime, durationSeconds, eventTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [evtObj.id, evtObj.serverId, evtObj.username, evtObj.sessionId, evtObj.eventState, evtObj.loginTime, evtObj.logoutTime, evtObj.durationSeconds, evtObj.eventTimestamp]
-        ).catch(() => {});
+        ));
       }
 
       // Update dailyItem lastLogout & status & accumulated usage
@@ -6014,10 +6926,10 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
         dailyItem.lastUpdated = nowIso;
 
         if (isMysqlConnected && dbPool) {
-          dbPool.query(
+          safeWrite('daily_user_activity', () => dbPool.query(
             `REPLACE INTO \`daily_user_activity\` (id, serverId, username, activityDate, firstLogin, lastLogout, sessionCount, totalUsageSeconds, currentStatus, lastUpdated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             [dailyItem.id, dailyItem.serverId, dailyItem.username, dailyItem.activityDate, dailyItem.firstLogin, dailyItem.lastLogout, dailyItem.sessionCount, dailyItem.totalUsageSeconds, dailyItem.currentStatus, dailyItem.lastUpdated]
-          ).catch(() => {});
+          ));
         }
       }
 
@@ -6068,10 +6980,10 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
       }
 
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('daily_user_activity', () => dbPool.query(
           `REPLACE INTO \`daily_user_activity\` (id, serverId, username, activityDate, firstLogin, lastLogout, sessionCount, totalUsageSeconds, currentStatus, lastUpdated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           [dailyItem.id, dailyItem.serverId, dailyItem.username, dailyItem.activityDate, dailyItem.firstLogin, dailyItem.lastLogout, dailyItem.sessionCount, dailyItem.totalUsageSeconds, dailyItem.currentStatus, dailyItem.lastUpdated]
-        ).catch(() => {});
+        ));
       }
     } else if (dailyItem && dailyItem.currentStatus === 'Active') {
       dailyItem.currentStatus = 'LoggedOut';
@@ -6079,10 +6991,10 @@ function processMonitoringTelemetry(serverId, telemetry, reqBody) {
       dailyItem.lastUpdated = nowIso;
 
       if (isMysqlConnected && dbPool) {
-        dbPool.query(
+        safeWrite('daily_user_activity', () => dbPool.query(
           `UPDATE \`daily_user_activity\` SET currentStatus = ?, lastLogout = ?, lastUpdated = ? WHERE id = ?`,
           [dailyItem.currentStatus, dailyItem.lastLogout, dailyItem.lastUpdated, dailyItem.id]
-        ).catch(() => {});
+        ));
       }
     }
   }
@@ -6128,10 +7040,10 @@ app.post('/api/agent/session-event', (req, res) => {
     }
 
     if (isMysqlConnected && dbPool) {
-      dbPool.query(
+      safeWrite('server_session_events', () => dbPool.query(
         `REPLACE INTO \`server_session_events\` (id, serverId, username, sessionId, eventState, loginTime, logoutTime, durationSeconds, eventTimestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [eventObj.id, eventObj.serverId, eventObj.username, eventObj.sessionId, eventObj.eventState, eventObj.loginTime, eventObj.logoutTime, eventObj.durationSeconds, eventObj.eventTimestamp]
-      ).catch(() => {});
+      ));
     }
 
     // Update Daily Accumulated User Activity
@@ -6169,10 +7081,10 @@ app.post('/api/agent/session-event', (req, res) => {
     }
 
     if (isMysqlConnected && dbPool) {
-      dbPool.query(
+      safeWrite('daily_user_activity', () => dbPool.query(
         `REPLACE INTO \`daily_user_activity\` (id, serverId, username, activityDate, firstLogin, lastLogout, sessionCount, totalUsageSeconds, currentStatus, lastUpdated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [dailyItem.id, dailyItem.serverId, dailyItem.username, dailyItem.activityDate, dailyItem.firstLogin, dailyItem.lastLogout, dailyItem.sessionCount, dailyItem.totalUsageSeconds, dailyItem.currentStatus, dailyItem.lastUpdated]
-      ).catch(() => {});
+      ));
     }
   }
 
@@ -6187,7 +7099,8 @@ app.post('/api/agent/session-event', (req, res) => {
 // POST /api/agent/duplicate-session-event (Called by Windows VPS Agent Watchdog)
 app.post('/api/agent/duplicate-session-event', async (req, res) => {
   try {
-    const { serverId, serverToken, username, newSessionId, oldSessionId, action, reason, timestamp } = req.body;
+    // Agent identity comes only from X-Agent-Key; serverId / X-Server-Id are identification hints, never authentication.
+    const { serverId, username, newSessionId, oldSessionId, action, reason, timestamp } = req.body;
     if (!serverId || !username) {
       return res.status(400).json({ success: false, error: 'serverId and username required' });
     }
@@ -6247,7 +7160,7 @@ app.post('/api/agent/duplicate-session-event', async (req, res) => {
         'DUPLICATE_LOGIN_AUTO_LOGOFF',
         serverName,
         `User "${username}" attempted multiple concurrent logins on ${serverName}. Kept New Session #${newSessionId} (Active), Forcefully Auto-Logged Off Older Session #${oldSessionId}. Action: ${eventRecord.action}`,
-        req.ip
+        req.clientIp
       );
 
       saveDiskDatabase();
@@ -6299,7 +7212,7 @@ app.post('/api/duplicate-logins/clear', requireAuth, async (req, res) => {
   }
 
   saveDiskDatabase();
-  logAudit(req.employee.name, req.employee.role, 'PURGE_DUPLICATE_LOGS', 'System', 'Cleared all duplicate login interception history', req.ip);
+  logAudit(req.employee.name, req.employee.role, 'PURGE_DUPLICATE_LOGS', 'System', 'Cleared all duplicate login interception history', req.clientIp);
 
   res.json({ success: true, message: 'All duplicate login audit records cleared successfully.' });
 });
@@ -6517,8 +7430,8 @@ app.get(['/api/reports/daily-user-activity', '/api/reports/daily-activity'], req
 
 // GET /api/agent/detect-server & /api/agent/my-ip (Auto-discovers calling VPS public IP & Server ID)
 app.get(['/api/agent/detect-server', '/api/agent/my-ip'], (req, res) => {
-  const rawClientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.connection?.remoteAddress || req.ip || '';
-  const clientIp = String(rawClientIp).split(',')[0].trim().replace(/^.*:/, '');
+  const rawClientIp = req.clientIp;
+  const clientIp = String(rawClientIp);
 
   const servers = memoryStore.servers || [];
   const matched = servers.find(s => s.ipPort && s.ipPort.split(':')[0].trim() === clientIp);
@@ -6532,11 +7445,11 @@ app.get(['/api/agent/detect-server', '/api/agent/my-ip'], (req, res) => {
   });
 });
 
-app.get(['/install.ps1', '/install', '/api/agent/install.ps1', '/api/agent/install'], (req, res) => {
+app.get(['/install.ps1', '/install', '/api/agent/install.ps1', '/api/agent/install'], async (req, res) => {
   let targetServerId = req.query.s || req.query.serverId || '';
 
-  const rawClientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.connection?.remoteAddress || req.ip || '';
-  const clientIp = String(rawClientIp).split(',')[0].trim().replace(/^.*:/, '');
+  const rawClientIp = req.clientIp;
+  const clientIp = String(rawClientIp);
 
   if (!targetServerId || targetServerId === 'auto' || targetServerId === 'srv-node-1') {
     const servers = memoryStore.servers || [];
@@ -6550,23 +7463,41 @@ app.get(['/install.ps1', '/install', '/api/agent/install.ps1', '/api/agent/insta
     }
   }
 
-  const rawHost = String(req.headers['x-forwarded-host'] || req.get('host') || 'vps.innovationwebworks.in').split(',')[0].trim();
-  const portalHost = (rawHost.includes('127.0.0.1') || rawHost.includes('localhost')) ? 'vps.innovationwebworks.in' : rawHost;
-  const rawProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const protocol = rawProto || (portalHost.includes('innovationwebworks.in') ? 'https' : req.protocol);
-  const portalBaseUrl = `${protocol}://${portalHost}`;
+  const portalBaseUrl = buildPortalUrl(config);
   const encodedServerId = encodeURIComponent(targetServerId);
-  // When an admin installs or runs bootstrap installer for a server, unblock it so it can connect fresh!
-  if (targetServerId && targetServerId !== 'auto' && memoryStore.deletedServers && Array.isArray(memoryStore.deletedServers)) {
-    const sId = targetServerId.toLowerCase();
-    const pIp = sId.split(':')[0];
-    memoryStore.deletedServers = memoryStore.deletedServers.filter(d => d !== sId && d !== pIp);
-    saveDiskDatabase();
+
+  // Pre-configured installer: a valid one-time token (15 min, bound to the server) embeds the Agent_Key.
+  // Unknown, expired, used, or mismatching tokens are ignored and the key-less installer is served.
+  let embeddedAgentKey = '';
+  const installToken = typeof req.query.t === 'string' ? req.query.t : '';
+  if (installToken) {
+    const tokenServer = findServerForKeyCheck(memoryStore.servers || [], targetServerId);
+    const redeemed = tokenServer ? consumeInstallerToken(installToken, tokenServer) : null;
+    if (redeemed && /^ak_[A-Za-z0-9_-]{43}$/.test(redeemed.agentKey)) embeddedAgentKey = redeemed.agentKey;
   }
-  if (clientIp && clientIp !== '127.0.0.1' && memoryStore.deletedServers && Array.isArray(memoryStore.deletedServers)) {
-    const cLower = clientIp.toLowerCase();
-    memoryStore.deletedServers = memoryStore.deletedServers.filter(d => d !== cLower && !d.startsWith(cLower + ':'));
-    saveDiskDatabase();
+  const agentConfigBlock = embeddedAgentKey ? `
+# Pre-configured Agent Key: write agent-config.json locked to SYSTEM + Administrators BEFORE the key is written
+try {
+    $cfgPath = "$agentDir\\agent-config.json"
+    if (-not (Test-Path $cfgPath)) { [System.IO.File]::WriteAllText($cfgPath, "{}") }
+    & icacls.exe "$cfgPath" /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" *>$null
+    $cfgJson = '{"serverId":"' + ($targetServerId -replace '[\\\\"]','') + '","portalBase":"' + $portalBase + '","serverToken":"vps_sec_token_default","agentKey":"${embeddedAgentKey}","intervalSeconds":5}'
+    [System.IO.File]::WriteAllText($cfgPath, $cfgJson)
+    Write-Host " [+] Agent key saved to agent-config.json (SYSTEM + Administrators only)" -ForegroundColor Green
+} catch {
+    Write-Host " [!] Could not write agent-config.json: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+` : '';
+  // When an admin installs or runs bootstrap installer for a server, unblock it so it can connect fresh!
+  try {
+    if (targetServerId && targetServerId !== 'auto') {
+      await restoreServerTombstones(String(targetServerId));
+    }
+    if (clientIp && clientIp !== '127.0.0.1') {
+      await restoreServerTombstones(String(clientIp));
+    }
+  } catch (err) {
+    console.error('[INSTALL] Could not clear tombstones:', err.message);
   }
 
 
@@ -6624,7 +7555,7 @@ if (-not (Test-Path $agentDir)) {
     New-Item -ItemType Directory -Path $agentDir -Force | Out-Null
 }
 $scriptDest = "$agentDir\\VpsAgent.ps1"
-
+${agentConfigBlock}
 # 4. Windows Defender & Antivirus Administrative Exclusions
 Write-Host " [*] Configuring Antivirus & Windows Defender Exclusions..." -ForegroundColor Gray
 try {
@@ -6785,6 +7716,7 @@ if ($procs) {
 `;
 
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  if (embeddedAgentKey) res.setHeader('Cache-Control', 'no-store');
   res.send(installerScript);
 });
 
@@ -6795,11 +7727,7 @@ app.get(['/install.bat', '/api/agent/install.bat'], (req, res) => {
     const servers = memoryStore.servers || [];
     targetServerId = (servers.length === 1 && servers[0] && (servers[0].ipPort || servers[0].id)) ? (servers[0].ipPort || servers[0].id) : 'srv-node-1';
   }
-  const rawHost = String(req.headers['x-forwarded-host'] || req.get('host') || 'vps.innovationwebworks.in').split(',')[0].trim();
-  const portalHost = (rawHost.includes('127.0.0.1') || rawHost.includes('localhost')) ? 'vps.innovationwebworks.in' : rawHost;
-  const rawProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
-  const protocol = rawProto || (portalHost.includes('innovationwebworks.in') ? 'https' : req.protocol);
-  const portalBaseUrl = `${protocol}://${portalHost}`;
+  const portalBaseUrl = buildPortalUrl(config);
   const encodedServerId = encodeURIComponent(targetServerId);
 
   const batScript = `@echo off
@@ -6851,8 +7779,8 @@ app.get(['/VpsAgentService.cs', '/agent/VpsAgentService.cs'], (req, res) => {
 app.get(['/api/agent/powershell-script', '/agent/VpsAgent.ps1', '/VpsAgent.ps1'], (req, res) => {
   let serverId = req.query.serverId || req.query.s || '';
   if (!serverId || serverId === 'auto') {
-    const rawClientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.headers['x-real-ip'] || req.connection?.remoteAddress || req.ip || '';
-    const clientIp = String(rawClientIp).split(',')[0].trim().replace(/^.*:/, '');
+    const rawClientIp = req.clientIp;
+    const clientIp = String(rawClientIp);
     const servers = memoryStore.servers || [];
     const matchedByIp = servers.find(s => s.ipPort && s.ipPort.split(':')[0].trim() === clientIp);
     if (matchedByIp) {
@@ -6863,7 +7791,7 @@ app.get(['/api/agent/powershell-script', '/agent/VpsAgent.ps1', '/VpsAgent.ps1']
       serverId = 'auto';
     }
   }
-  const portalUrl = 'https://vps.innovationwebworks.in/api/agent/telemetry';
+  const portalUrl = buildPortalUrl(config, '/api/agent/telemetry');
 
   const agentPath = path.join(__dirname, 'VpsAgent.ps1');
   if (fs.existsSync(agentPath)) {
@@ -7071,7 +7999,7 @@ function Send-VpsTelemetry {
                 cpuCores        = [int]$cpuCores
                 cpuLogical      = [int]$cpuLogical
                 osName          = $osCaption
-                specs           = "$cpuCores Cores ($cpuLogical vCPU) • $cpuName"
+                specs           = "$cpuCores Cores ($cpuLogical vCPU) â€¢ $cpuName"
             }
             ram                 = @{
                 totalGB         = $totalRamGB
@@ -7145,15 +8073,38 @@ app.get('/api/users', requireAuth, async (req, res) => {
     }
   }
 
-  res.json({ success: true, source: isMysqlConnected ? 'mysql' : 'disk_file', users: clientList });
+  res.json({ success: true, source: isMysqlConnected ? 'mysql' : 'disk_file', users: clientList.map(toPublicClient) });
 });
 
 // POST USER (Requires Auth; Sets salesAgent for SALESPERSON)
-app.post('/api/users', requireAuth, async (req, res) => {
+app.post('/api/users', requireAuth, jobRouteHandler(async (req, res) => {
   const u = req.body;
   if (!u || !u.company) return res.status(400).json({ error: 'Company/Client name is required' });
   if (!u.id) u.id = `user-${Date.now()}`;
   if (!u.username) u.username = u.company.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!u.password) u.password = generatePassword();
+  try {
+    u.password = sealPw(u.password);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the password' });
+  }
+
+  // Validate the provisioning job BEFORE the client record is stored: a hostile username/drive/etc. must answer 400
+  // and leave neither a client nor a job behind.
+  let preparedProvisionJob = null;
+  if (u.password && u.serverId && u.autoProvision !== false) {
+    preparedProvisionJob = prepareJobParams({
+      action: 'PROVISION_TALLY_USER',
+      serverId: u.serverId,
+      companyName: u.company,
+      username: u.username,
+      password: u.password,
+      drive: u.drive,
+      expiryDate: u.expiryDate,
+      setupTSplus: true,
+      tallyVersion: u.tallyVersion || req.body.tallyVersion || ''
+    });
+  }
 
   if (req.employee.role === 'SALESPERSON') {
     u.salesAgent = req.employee.name || req.employee.username;
@@ -7170,14 +8121,14 @@ app.post('/api/users', requireAuth, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status, tallyVersion)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           u.id,
           u.serverId || 'vps-1786786182287',
           u.clientType || 'Shared',
           u.username,
-          u.password || 'Pass#123',
+          u.password,
           u.tallySerialNo || '',
           u.company,
           u.paymentType || 'Online / Bank',
@@ -7189,7 +8140,8 @@ app.post('/api/users', requireAuth, async (req, res) => {
           u.customerPhone || '',
           u.customerEmail || '',
           u.notes || '',
-          u.status || 'ACTIVE'
+          u.status || 'ACTIVE',
+          String(u.tallyVersion || '').slice(0, 50)
         ]
       );
     } catch (err) {
@@ -7197,35 +8149,26 @@ app.post('/api/users', requireAuth, async (req, res) => {
     }
   }
 
-  logAudit(req.employee.name, req.employee.role, 'USER_CREATED', u.company, `Client created (${u.username} on ${u.drive})`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'USER_CREATED', u.company, `Client created (${u.username} on ${u.drive})`, req.clientIp);
 
   // Auto-enqueue remote VPS provisioning job if password and server are provided
   let provisionJob = null;
-  if (u.password && u.serverId && u.autoProvision !== false) {
-    provisionJob = queueProvisionJob({
-      serverId: u.serverId,
-      companyName: u.company,
-      username: u.username,
-      password: u.password,
-      drive: u.drive,
-      expiryDate: u.expiryDate,
-      setupTSplus: true,
-      tallyVersion: u.tallyVersion || req.body.tallyVersion || ''
-    });
-    console.log(`🚀 [PROVISION QUEUE] Job created for user '${u.username}' on VPS '${u.serverId}' (Drive: ${u.drive}, Tally: ${u.tallyVersion || 'Default'})`);
+  if (preparedProvisionJob) {
+    provisionJob = queueValidatedServerJob(preparedProvisionJob);
+    console.log(`ðŸš€ [PROVISION QUEUE] Job created for user '${u.username}' on VPS '${u.serverId}' (Drive: ${u.drive}, Tally: ${u.tallyVersion || 'Default'})`);
   }
 
   res.json({ 
     success: true, 
-    user: u, 
-    provisionJob: provisionJob,
+    user: toPublicClient(u), 
+    provisionJob: toPublicJob(provisionJob),
     message: provisionJob 
       ? `Client created & Provisioning command dispatched to VPS Node for ${u.username} on ${u.drive}!` 
       : `Client created successfully.` 
   });
-});
+}));
 
-// POST /api/users/bulk-import — creates or updates shared VPS subscriptions from a reviewed spreadsheet upload.
+// POST /api/users/bulk-import â€” creates or updates shared VPS subscriptions from a reviewed spreadsheet upload.
 app.post('/api/users/bulk-import', requireAuth, async (req, res) => {
   const entries = Array.isArray(req.body?.entries) ? req.body.entries.slice(0, 1000) : [];
   if (!entries.length) return res.status(400).json({ success: false, error: 'No subscription rows supplied for import.' });
@@ -7260,6 +8203,14 @@ app.post('/api/users/bulk-import', requireAuth, async (req, res) => {
       }
     }
 
+    let sealedImportPassword;
+    try {
+      sealedImportPassword = sealPw(existing?.password || raw.password || generatePassword());
+    } catch {
+      rejected.push({ username, company, reason: 'Unable to protect the password.' });
+      continue;
+    }
+
     const record = {
       ...existing,
       ...raw,
@@ -7269,7 +8220,7 @@ app.post('/api/users/bulk-import', requireAuth, async (req, res) => {
       serverId,
       drive,
       clientType: 'Shared',
-      password: existing?.password || raw.password || 'Pass#123',
+      password: sealedImportPassword,
       billDate: raw.billDate || existing?.billDate || today,
       expiryDate: raw.expiryDate || existing?.expiryDate || expiryFallback,
       paymentType: existing?.paymentType || 'Online / Bank',
@@ -7289,9 +8240,9 @@ app.post('/api/users/bulk-import', requireAuth, async (req, res) => {
     if (isMysqlConnected && dbPool) {
       try {
         await dbPool.query(
-          `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [record.id, record.serverId, record.clientType, record.username, record.password, record.tallySerialNo || '', record.company, record.paymentType, parseFloat(record.amount) || 0, record.billDate, record.expiryDate, record.salesAgent, record.drive, record.customerPhone || '', record.customerEmail || '', record.notes || '', record.status]
+          `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status, tallyVersion)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [record.id, record.serverId, record.clientType, record.username, record.password, record.tallySerialNo || '', record.company, record.paymentType, parseFloat(record.amount) || 0, record.billDate, record.expiryDate, record.salesAgent, record.drive, record.customerPhone || '', record.customerEmail || '', record.notes || '', record.status, String(record.tallyVersion || '').slice(0, 50)]
         );
       } catch (err) {
         console.error('MySQL bulk import row error:', err.message);
@@ -7300,17 +8251,17 @@ app.post('/api/users/bulk-import', requireAuth, async (req, res) => {
   }
 
   saveDiskDatabase();
-  logAudit(req.employee.name, req.employee.role, 'USERS_BULK_IMPORTED', 'Shared VPS subscriptions', `${created.length} created, ${updated.length} updated, ${rejected.length} rejected`, req.ip);
-  res.json({ success: true, created: created.length, updated: updated.length, rejected, users: [...created, ...updated] });
+  logAudit(req.employee.name, req.employee.role, 'USERS_BULK_IMPORTED', 'Shared VPS subscriptions', `${created.length} created, ${updated.length} updated, ${rejected.length} rejected`, req.clientIp);
+  res.json({ success: true, created: created.length, updated: updated.length, rejected, users: [...created, ...updated].map(toPublicClient) });
 });
 
 // POST /api/users/:id/provision-vps (Manually trigger / re-trigger remote VPS provisioning)
-app.post('/api/users/:id/provision-vps', requireAuth, async (req, res) => {
+app.post('/api/users/:id/provision-vps', requireAuth, jobRouteHandler(async (req, res) => {
   const { id } = req.params;
   const user = (memoryStore.users || []).find(u => u.id === id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const password = req.body.password || user.password || 'Pass#123';
+  const password = req.body.password || user.password || generatePassword();
   const targetServerId = req.body.serverId || user.serverId;
   const targetDrive = req.body.drive || user.drive || 'Drive D';
 
@@ -7330,18 +8281,18 @@ app.post('/api/users/:id/provision-vps', requireAuth, async (req, res) => {
     'USER_REPROVISION_QUEUED',
     user.company,
     `Manual provisioning dispatched for ${user.username} on VPS ${targetServerId} (${targetDrive})`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
     success: true,
     message: `Provisioning job queued for ${user.username} on VPS Node (${targetDrive})`,
-    job
+    job: toPublicJob(job)
   });
-});
+}));
 
 // PUT USER (Requires Auth; Prevents BOLA for SALESPERSON)
-app.put('/api/users/:id', requireAuth, async (req, res) => {
+app.put('/api/users/:id', requireAuth, jobRouteHandler(async (req, res) => {
   const { id } = req.params;
   const u = req.body;
   u.id = id;
@@ -7355,6 +8306,19 @@ app.put('/api/users/:id', requireAuth, async (req, res) => {
     }
     u.salesAgent = existing.salesAgent; // Prevent reassigning sales agent
   }
+  if (!u.password) u.password = existing?.password || generatePassword();
+
+  // Seal before any copy is stored. A password is "changed" when it differs from the stored one after decrypting.
+  let passwordChanged;
+  try {
+    const incoming = String(u.password);
+    if (!existing) passwordChanged = true;
+    else if (isCiphertext(incoming)) passwordChanged = existing.password !== incoming;
+    else { try { passwordChanged = openPw(existing.password) !== incoming; } catch { passwordChanged = true; } }
+    u.password = sealPw(incoming);
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the password' });
+  }
 
   const idx = memoryStore.users.findIndex(item => item.id === id);
   if (idx >= 0) {
@@ -7367,14 +8331,14 @@ app.put('/api/users/:id', requireAuth, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `REPLACE INTO \`client_subscriptions\` (id, serverId, clientType, username, password, tallySerialNo, company, paymentType, amount, billDate, expiryDate, salesAgent, drive, customerPhone, customerEmail, notes, status, tallyVersion)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           u.id,
           u.serverId || 'vps-1786786182287',
           u.clientType || 'Shared',
           u.username,
-          u.password || 'Pass#123',
+          u.password,
           u.tallySerialNo || '',
           u.company,
           u.paymentType || 'Online / Bank',
@@ -7386,7 +8350,8 @@ app.put('/api/users/:id', requireAuth, async (req, res) => {
           u.customerPhone || '',
           u.customerEmail || '',
           u.notes || '',
-          u.status || 'ACTIVE'
+          u.status || 'ACTIVE',
+          String(u.tallyVersion || '').slice(0, 50)
         ]
       );
     } catch (err) {
@@ -7403,26 +8368,26 @@ app.put('/api/users/:id', requireAuth, async (req, res) => {
       status: isEnabled ? 'Active' : 'Disabled',
       enabled: isEnabled
     });
-    console.log(`🚀 [STATUS QUEUE] Toggled user '${u.username}' to '${isEnabled ? 'Active' : 'Disabled'}' on VPS '${targetServerId}'`);
+    console.log(`ðŸš€ [STATUS QUEUE] Toggled user '${u.username}' to '${isEnabled ? 'Active' : 'Disabled'}' on VPS '${targetServerId}'`);
   }
 
-  if (u.password && (!existing || existing.password !== u.password)) {
+  if (u.password && passwordChanged) {
     const targetServerId = u.serverId || existing?.serverId || 'srv-node-1';
     queuePasswordChangeJob({
       serverId: targetServerId,
       username: u.username,
       newPassword: u.password
     });
-    console.log(`🚀 [PASSWORD QUEUE] Password update queued for user '${u.username}' on VPS '${targetServerId}'`);
+    console.log(`ðŸš€ [PASSWORD QUEUE] Password update queued for user '${u.username}' on VPS '${targetServerId}'`);
   }
 
-  logAudit(req.employee.name, req.employee.role, 'USER_UPDATED', u.company, `Client updated (${u.username})`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'USER_UPDATED', u.company, `Client updated (${u.username})`, req.clientIp);
 
-  res.json({ success: true, user: u });
-});
+  res.json({ success: true, user: toPublicClient(u) });
+}));
 
 // POST /api/users/:id/change-password (Syncs password directly to Windows VPS via Agent)
-app.post('/api/users/:id/change-password', requireAuth, async (req, res) => {
+app.post('/api/users/:id/change-password', requireAuth, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { id } = req.params;
   const { newPassword } = req.body;
 
@@ -7443,12 +8408,19 @@ app.post('/api/users/:id/change-password', requireAuth, async (req, res) => {
     }
   }
 
-  user.password = newPassword.trim();
+  let sealedNewPassword;
+  try {
+    sealedNewPassword = sealPw(newPassword.trim());
+  } catch {
+    return res.status(500).json({ success: false, error: 'Unable to protect the password' });
+  }
+
+  user.password = sealedNewPassword;
   saveDiskDatabase();
 
   if (isMysqlConnected && dbPool) {
     try {
-      await dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE \`id\` = ?`, [newPassword.trim(), id]);
+      await dbPool.query(`UPDATE \`client_subscriptions\` SET \`password\` = ? WHERE \`id\` = ?`, [sealedNewPassword, id]);
     } catch (dbErr) {
       console.error("MySQL Password Update Error:", dbErr.message);
     }
@@ -7461,7 +8433,7 @@ app.post('/api/users/:id/change-password', requireAuth, async (req, res) => {
   const job = queuePasswordChangeJob({
     serverId: targetServerId,
     username: user.username,
-    newPassword: newPassword.trim()
+    newPassword: sealedNewPassword
   });
 
   logAudit(
@@ -7470,7 +8442,7 @@ app.post('/api/users/:id/change-password', requireAuth, async (req, res) => {
     'PASSWORD_CHANGED',
     user.company,
     `Password updated for client ${user.username} on VPS ${targetServerId}. Job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -7478,10 +8450,10 @@ app.post('/api/users/:id/change-password', requireAuth, async (req, res) => {
     message: `Password updated! Automated sync job dispatched to Windows VPS (${targetServer?.name || targetServerId}). Will apply within 10 seconds.`,
     jobId: job.id
   });
-});
+}));
 
 // POST /api/users/:id/toggle-status (Enables / Disables user account directly on Windows VPS)
-app.post('/api/users/:id/toggle-status', requireAuth, async (req, res) => {
+app.post('/api/users/:id/toggle-status', requireAuth, jobRouteHandler(async (req, res) => {
   const { id } = req.params;
   const { status } = req.body; // 'Active' or 'Disabled'
 
@@ -7522,7 +8494,7 @@ app.post('/api/users/:id/toggle-status', requireAuth, async (req, res) => {
     isEnabled ? 'USER_ENABLED' : 'USER_DISABLED',
     user.company,
     `Account ${user.username} set to ${newStatus}. VPS toggle job ${job.id} dispatched.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -7531,10 +8503,10 @@ app.post('/api/users/:id/toggle-status', requireAuth, async (req, res) => {
     message: `Client ${user.username} is now ${newStatus}. VPS state update queued for server (${targetServer?.name || targetServerId}).`,
     jobId: job.id
   });
-});
+}));
 
 // POST /api/servers/:serverId/logoff-session (Forces session logoff / disconnect on Windows VPS)
-app.post(['/api/servers/:serverId/logoff-session', '/api/servers/:serverId/force-logoff', '/api/servers/:serverId/logoff'], requireAuth, async (req, res) => {
+app.post(['/api/servers/:serverId/logoff-session', '/api/servers/:serverId/force-logoff', '/api/servers/:serverId/logoff'], requireAuth, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId } = req.params;
   const { sessionId, username } = req.body;
 
@@ -7578,7 +8550,7 @@ app.post(['/api/servers/:serverId/logoff-session', '/api/servers/:serverId/force
     'SESSION_TERMINATED',
     targetServer?.name || targetServerId,
     `Force logoff dispatched for session ${sessionId || ''} (${username || 'User'}) on VPS ${targetServerId}.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -7586,7 +8558,7 @@ app.post(['/api/servers/:serverId/logoff-session', '/api/servers/:serverId/force
     message: `Force logoff command dispatched for ${username || 'Session ' + sessionId} on VPS. Agent will terminate session.`,
     jobId: job.id
   });
-});
+}));
 
 // GET /api/servers/:serverId/sessions/:sessionId/shadow-launcher (Generates 1-Click .bat launcher for RDS Session Shadow)
 app.get('/api/servers/:serverId/sessions/:sessionId/shadow-launcher', requireAuth, (req, res) => {
@@ -7642,7 +8614,7 @@ if %errorlevel% neq 0 (
 });
 
 // POST /api/servers/:serverId/configure-shadow (Dispatches policy update to agent)
-app.post('/api/servers/:serverId/configure-shadow', requireAuth, async (req, res) => {
+app.post('/api/servers/:serverId/configure-shadow', requireAuth, jobRouteHandler(async (req, res) => {
   const { serverId } = req.params;
   const shadowLevel = req.body.shadowLevel || 2;
 
@@ -7665,14 +8637,14 @@ app.post('/api/servers/:serverId/configure-shadow', requireAuth, async (req, res
     'SHADOW_POLICY_CONFIGURED',
     targetServer?.name || targetServerId,
     `Dispatched RDS Shadowing policy (Level ${shadowLevel}) to VPS ${targetServerId}.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({ success: true, message: `Shadowing policy job queued for ${targetServer?.name || targetServerId}.`, jobId: job.id });
-});
+}));
 
 // POST /api/servers/:serverId/duplicate-session-policy (Configures Audit vs Enforce mode)
-app.post('/api/servers/:serverId/duplicate-session-policy', requireAuth, async (req, res) => {
+app.post('/api/servers/:serverId/duplicate-session-policy', requireAuth, jobRouteHandler(async (req, res) => {
   const { serverId } = req.params;
   const mode = req.body.mode || 'Audit'; // 'Audit' or 'Enforce'
   const gracePeriodSeconds = req.body.gracePeriodSeconds || 15;
@@ -7697,7 +8669,7 @@ app.post('/api/servers/:serverId/duplicate-session-policy', requireAuth, async (
     'DUPLICATE_SESSION_POLICY_CONFIGURED',
     targetServer?.name || targetServerId,
     `Dispatched Duplicate Session Policy (Mode: ${mode}, Grace: ${gracePeriodSeconds}s) to VPS ${targetServerId}.`,
-    req.ip
+    req.clientIp
   );
 
   res.json({
@@ -7705,14 +8677,14 @@ app.post('/api/servers/:serverId/duplicate-session-policy', requireAuth, async (
     message: `Duplicate session policy job (${mode} mode) queued for ${targetServer?.name || targetServerId}.`,
     jobId: job.id
   });
-});
+}));
 
 // =========================================================================
 // REAL-TIME ZERO-LOGIN LIVE SCREEN MONITORING APIS
 // =========================================================================
 
 // GET /api/servers/:serverId/sessions/:sessionId/live-screen
-app.get('/api/servers/:serverId/sessions/:sessionId/live-screen', requireAuth, async (req, res) => {
+app.get('/api/servers/:serverId/sessions/:sessionId/live-screen', requireAuth, jobRouteHandler(async (req, res) => {
   const { serverId, sessionId } = req.params;
   const force = req.query.force === 'true';
 
@@ -7786,7 +8758,7 @@ app.get('/api/servers/:serverId/sessions/:sessionId/live-screen', requireAuth, a
       });
     }
   });
-});
+}));
 
 // GET /api/servers/:serverId/sessions/:sessionId/screen.jpg (Raw Binary JPEG Stream - Admin Protected)
 app.get('/api/servers/:serverId/sessions/:sessionId/screen.jpg', requireAdmin, (req, res) => {
@@ -7818,7 +8790,7 @@ app.get('/api/servers/:serverId/sessions/:sessionId/screen.jpg', requireAdmin, (
 });
 
 // POST /api/servers/:serverId/sessions/:sessionId/capture-screen
-app.post('/api/servers/:serverId/sessions/:sessionId/capture-screen', requireAdmin, async (req, res) => {
+app.post('/api/servers/:serverId/sessions/:sessionId/capture-screen', requireAdmin, jobRequestGuard, jobRouteHandler(async (req, res) => {
   const { serverId, sessionId } = req.params;
   const { username } = req.body;
 
@@ -7843,7 +8815,7 @@ app.post('/api/servers/:serverId/sessions/:sessionId/capture-screen', requireAdm
     sessionId,
     serverId: targetId
   });
-});
+}));
 
 // DELETE USER (Requires Admin Authorization)
 app.delete('/api/users/:id', requireAdmin, async (req, res) => {
@@ -7861,14 +8833,120 @@ app.delete('/api/users/:id', requireAdmin, async (req, res) => {
     } catch (err) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, 'USER_DELETED', id, `Deleted client subscription ${id}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'USER_DELETED', id, `Deleted client subscription ${id}`, req.clientIp);
 
   res.json({ success: true });
 });
 
+// Entity store for requests/renewals: MySQL mode only; JSON mode keeps the memoryStore behavior (Req 10.4, 10.5).
+let mysqlEntityStore = null;
+let mysqlEntityStorePool = null;
+function getEntityStore() {
+  if (!(isMysqlConnected && dbPool && entityTablesReady)) return null;
+  if (!mysqlEntityStore || mysqlEntityStorePool !== dbPool) {
+    // Migration passwords are sealed with the configured key before they are written (Req 10.10).
+    mysqlEntityStore = createMysqlEntityStore(dbPool, { sealPassword: (p) => sealPassword(String(p), config.encryptionKey), isCiphertext });
+    mysqlEntityStorePool = dbPool;
+  }
+  return mysqlEntityStore;
+}
+
+// Deleted-server tombstones (Req 10.12, 10.13): `deleted_servers` rows in MySQL mode, memoryStore.deletedServers otherwise.
+// True when any of the terms is tombstoned.
+async function isServerTermDeleted(terms) {
+  const list = (terms || []).filter((t) => typeof t === 'string' && t !== '').map((t) => t.toLowerCase());
+  const es = getEntityStore();
+  if (es) {
+    try {
+      for (const t of list) { if (await es.isDeleted(t)) return true; }
+      return false;
+    } catch (err) {
+      console.error('[TOMBSTONE] isDeleted lookup failed:', err.message);
+      return false;
+    }
+  }
+  const dl = memoryStore.deletedServers;
+  return Array.isArray(dl) && list.some((t) => dl.includes(t));
+}
+// Tombstoned terms that still match an active server (input for the agent-key readiness check).
+async function activeServerDeletedTokens() {
+  const out = [];
+  for (const s of memoryStore.servers || []) {
+    for (const t of tombstoneTerms(s)) {
+      if (await isServerTermDeleted([t])) out.push(t);
+    }
+  }
+  return out;
+}
+// Removes tombstones for a re-added/re-installed server (object, or a bare id/ip string).
+async function restoreServerTombstones(server) {
+  const es = getEntityStore();
+  if (es) { await restoreServer(es, server); return; }
+  const tokens = new Set(tombstoneTerms(server));
+  if (!tokens.size || !Array.isArray(memoryStore.deletedServers)) return;
+  memoryStore.deletedServers = memoryStore.deletedServers.filter((d) => !tokens.has(d));
+  saveDiskDatabase();
+}
+
+// Migration records: entity store in MySQL mode, memoryStore + database.json otherwise. Responses use toPublicMigration.
+async function migList() {
+  const es = getEntityStore();
+  return es ? await es.list('migrations') : (memoryStore.migrations || []);
+}
+async function migGet(id) {
+  if (typeof id !== 'string' || id === '') return null;
+  const es = getEntityStore();
+  return es ? await es.get('migrations', id) : ((memoryStore.migrations || []).find((m) => m.id === id) || null);
+}
+async function migCreate(mig) {
+  const es = getEntityStore();
+  if (es) { await es.put('migrations', mig); return; }
+  if (!memoryStore.migrations) memoryStore.migrations = [];
+  memoryStore.migrations.unshift(mig);
+  saveDiskDatabase();
+}
+async function migSave(mig) {
+  const es = getEntityStore();
+  if (es) { await es.put('migrations', mig); return; }
+  saveDiskDatabase();
+}
+// For stream callbacks that cannot await; failures are logged without record contents.
+function migSaveQuiet(mig) {
+  migSave(mig).catch((e) => console.error('[Migrations] save failed:', e && e.message));
+}
+async function migRemove(id) {
+  const es = getEntityStore();
+  if (es) { await es.remove('migrations', id); return; }
+  memoryStore.migrations = (memoryStore.migrations || []).filter((m) => m.id !== id);
+  saveDiskDatabase();
+}
+
+// One-time startup import of legacy entities (Req 10.6, 10.11). Reads database.json only; never writes it.
+async function runLegacyEntityImport() {
+  const es = getEntityStore();
+  if (!es) return;
+  let legacy = null;
+  try {
+    if (fs.existsSync(DB_FILE_PATH)) legacy = diskStore.readLegacyFile();
+  } catch (e) {
+    console.error('[Import] could not read database.json:', e && e.message);
+  }
+  try {
+    const result = await importLegacyEntities(es, [memoryStore, legacy], (m) => console.log(typeof m === 'string' ? m : '[Import] ' + JSON.stringify(m)));
+    console.log('[Import] legacy entity import finished:', JSON.stringify(result));
+  } catch (e) {
+    console.error('[Import] legacy entity import failed:', e && e.message);
+  }
+}
+
 // GET REQUESTS (Requires Auth)
-app.get('/api/requests', requireAuth, (req, res) => {
+app.get('/api/requests', requireAuth, async (req, res) => {
   let reqList = memoryStore.requests || [];
+  const es = getEntityStore();
+  if (es) {
+    try { reqList = await es.list('requests'); }
+    catch (e) { console.error('[Requests] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load requests' }); }
+  }
   if (req.employee.role === 'SALESPERSON') {
     const agentName = (req.employee.name || '').toLowerCase();
     const agentUser = (req.employee.username || '').toLowerCase();
@@ -7880,55 +8958,89 @@ app.get('/api/requests', requireAuth, (req, res) => {
 });
 
 // POST REQUEST (Requires Auth)
-app.post('/api/requests', requireAuth, (req, res) => {
+app.post('/api/requests', requireAuth, async (req, res) => {
   const newReq = req.body;
   if (!newReq.salesAgent && req.employee.role === 'SALESPERSON') {
     newReq.salesAgent = req.employee.name || req.employee.username;
   }
-  if (!memoryStore.requests) memoryStore.requests = [];
-  memoryStore.requests.unshift(newReq);
-  saveDiskDatabase();
-  logAudit(req.employee.name, req.employee.role, 'ONBOARDING_REQUESTED', newReq.company, `New client onboarding request submitted`, req.ip);
+  const es = getEntityStore();
+  if (es) {
+    try {
+      if (newReq.id === undefined || newReq.id === null || newReq.id === '') newReq.id = `REQ-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      await es.put('requests', newReq);
+    } catch (e) { console.error('[Requests] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save request' }); }
+  } else {
+    if (!memoryStore.requests) memoryStore.requests = [];
+    memoryStore.requests.unshift(newReq);
+    saveDiskDatabase();
+  }
+  logAudit(req.employee.name, req.employee.role, 'ONBOARDING_REQUESTED', newReq.company, `New client onboarding request submitted`, req.clientIp);
   res.json({ success: true, request: newReq });
 });
 
 // PUT REQUEST (Requires Auth)
-app.put('/api/requests/:id', requireAuth, (req, res) => {
+app.put('/api/requests/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const update = req.body;
-  if (memoryStore.requests) {
+  const es = getEntityStore();
+  if (es) {
+    try {
+      const existing = await es.get('requests', id);
+      if (existing) await es.put('requests', { ...existing, ...update, id: existing.id });
+    } catch (e) { console.error('[Requests] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update request' }); }
+  } else if (memoryStore.requests) {
     memoryStore.requests = memoryStore.requests.map(r => r.id === id ? { ...r, ...update } : r);
     saveDiskDatabase();
   }
-  logAudit(req.employee.name, req.employee.role, 'REQUEST_STATUS_UPDATED', id, `Request ${id} status updated to ${update.status || 'Updated'}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'REQUEST_STATUS_UPDATED', id, `Request ${id} status updated to ${update.status || 'Updated'}`, req.clientIp);
   res.json({ success: true });
 });
 
 // GET RENEWALS (Requires Auth)
-app.get('/api/renewals', requireAuth, (req, res) => {
-  res.json({ success: true, renewals: memoryStore.renewals || [] });
+app.get('/api/renewals', requireAuth, async (req, res) => {
+  let renewals = memoryStore.renewals || [];
+  const es = getEntityStore();
+  if (es) {
+    try { renewals = await es.list('renewals'); }
+    catch (e) { console.error('[Renewals] list failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to load renewals' }); }
+  }
+  res.json({ success: true, renewals });
 });
 
 // POST RENEWALS (Requires Auth)
-app.post('/api/renewals', requireAuth, (req, res) => {
+app.post('/api/renewals', requireAuth, async (req, res) => {
   const newRen = req.body;
   newRen.requestedBy = req.employee.name;
-  if (!memoryStore.renewals) memoryStore.renewals = [];
-  memoryStore.renewals.unshift(newRen);
-  saveDiskDatabase();
-  logAudit(req.employee.name, req.employee.role, 'RENEWAL_REQUESTED', newRen.company, `Renewal request submitted for ${newRen.company}`, req.ip);
+  const es = getEntityStore();
+  if (es) {
+    try {
+      if (newRen.id === undefined || newRen.id === null || newRen.id === '') newRen.id = `REN-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      await es.put('renewals', newRen);
+    } catch (e) { console.error('[Renewals] save failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to save renewal' }); }
+  } else {
+    if (!memoryStore.renewals) memoryStore.renewals = [];
+    memoryStore.renewals.unshift(newRen);
+    saveDiskDatabase();
+  }
+  logAudit(req.employee.name, req.employee.role, 'RENEWAL_REQUESTED', newRen.company, `Renewal request submitted for ${newRen.company}`, req.clientIp);
   res.json({ success: true, renewal: newRen });
 });
 
 // PUT RENEWALS (Admin Only)
-app.put('/api/renewals/:id', requireAdmin, (req, res) => {
+app.put('/api/renewals/:id', requireAdmin, async (req, res) => {
   const { id } = req.params;
   const update = req.body;
-  if (memoryStore.renewals) {
+  const es = getEntityStore();
+  if (es) {
+    try {
+      const existing = await es.get('renewals', id);
+      if (existing) await es.put('renewals', { ...existing, ...update, id: existing.id });
+    } catch (e) { console.error('[Renewals] update failed:', e.message); return res.status(500).json({ success: false, error: 'Failed to update renewal' }); }
+  } else if (memoryStore.renewals) {
     memoryStore.renewals = memoryStore.renewals.map(r => r.id === id ? { ...r, ...update } : r);
     saveDiskDatabase();
   }
-  logAudit(req.employee.name, req.employee.role, 'RENEWAL_STATUS_UPDATED', id, `Renewal ${id} status updated to ${update.status || 'Updated'}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'RENEWAL_STATUS_UPDATED', id, `Renewal ${id} status updated to ${update.status || 'Updated'}`, req.clientIp);
   res.json({ success: true });
 });
 
@@ -7948,7 +9060,7 @@ app.get('/api/audit-logs', requireAdmin, async (req, res) => {
 app.post('/api/audit-logs', requireAuth, (req, res) => {
   const logEntry = req.body;
   if (logEntry && logEntry.id) {
-    logAudit(req.employee.name, req.employee.role, logEntry.action, logEntry.target, logEntry.details, req.ip);
+    logAudit(req.employee.name, req.employee.role, logEntry.action, logEntry.target, logEntry.details, req.clientIp);
   }
   res.json({ success: true, log: logEntry });
 });
@@ -7976,9 +9088,9 @@ async function sendTicketEmailNotification({ to, subject, htmlContent }) {
       subject,
       html: htmlContent
     });
-    console.log(`✉️ Support ticket email successfully dispatched to: ${to}`);
+    console.log(`âœ‰ï¸ Support ticket email successfully dispatched to: ${to}`);
   } catch (err) {
-    console.error(`⚠️ Support ticket email error (${to}):`, err.message);
+    console.error(`âš ï¸ Support ticket email error (${to}):`, err.message);
   }
 }
 
@@ -8092,6 +9204,7 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
     resolutionNotes: t.resolutionNotes || '',
     voiceNoteUrl: voiceNoteUrl,
     createdBy: req.employee.name || req.employee.username || 'Staff',
+    source: 'STAFF',
     resolvedAt: isDirectlyResolved ? new Date().toISOString().replace('T', ' ').substring(0, 19) : null,
     createdAt: new Date().toISOString().replace('T', ' ').substring(0, 19)
   };
@@ -8103,8 +9216,8 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `INSERT INTO \`support_tickets\` (id, clientId, clientName, company, customerPhone, customerEmail, serverId, serverName, drive, issueCategory, subject, description, priority, status, assignedTo, assignedToEmail, resolutionNotes, voiceNoteUrl, createdBy, resolvedAt, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO \`support_tickets\` (id, clientId, clientName, company, customerPhone, customerEmail, serverId, serverName, drive, issueCategory, subject, description, priority, status, assignedTo, assignedToEmail, resolutionNotes, voiceNoteUrl, createdBy, source, resolvedAt, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newTicket.id,
           newTicket.clientId,
@@ -8125,6 +9238,7 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
           newTicket.resolutionNotes,
           newTicket.voiceNoteUrl,
           newTicket.createdBy,
+          newTicket.source || '',
           newTicket.resolvedAt,
           newTicket.createdAt
         ]
@@ -8134,15 +9248,15 @@ app.post('/api/tickets', requireAuth, async (req, res) => {
     }
   }
 
-  logAudit(req.employee.name, req.employee.role, 'TICKET_CREATED', newTicket.id, `Created support ticket for ${newTicket.company} (${newTicket.issueCategory}) [Status: ${newTicket.status}]`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'TICKET_CREATED', newTicket.id, `Created support ticket for ${newTicket.company} (${newTicket.issueCategory}) [Status: ${newTicket.status}]`, req.clientIp);
 
   // AUTOMATED EMAIL DISPATCH
   const priorityColor = newTicket.priority === 'URGENT' ? '#f43f5e' : (newTicket.priority === 'HIGH' ? '#f59e0b' : '#38bdf8');
   const creationEmailHtml = `
     <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 580px; margin: auto; border: 1px solid rgba(56, 189, 248, 0.25);">
       <div style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 14px; margin-bottom: 16px;">
-        <h2 style="color: #38bdf8; margin: 0; font-size: 20px;">🎫 Support Ticket Raised [${newTicket.id}]</h2>
-        <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Innovation Web Works • VPS Operations & Support</div>
+        <h2 style="color: #38bdf8; margin: 0; font-size: 20px;">ðŸŽ« Support Ticket Raised [${newTicket.id}]</h2>
+        <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Innovation Web Works â€¢ VPS Operations & Support</div>
       </div>
       
       <p style="color: #e2e8f0; font-size: 15px; margin-top: 0;">Hello <strong>${newTicket.company}</strong>,</p>
@@ -8223,7 +9337,7 @@ app.post('/api/tickets/:id/claim', requireAuth, async (req, res) => {
     }
   }
 
-  logAudit(staffName, req.employee.role, 'TICKET_CLAIMED', id, `${staffName} claimed and started working on ticket ${id}`, req.ip);
+  logAudit(staffName, req.employee.role, 'TICKET_CLAIMED', id, `${staffName} claimed and started working on ticket ${id}`, req.clientIp);
 
   res.json({ success: true, ticket: updatedTicket });
 });
@@ -8234,6 +9348,7 @@ app.post('/api/tickets/:id/claim', requireAuth, async (req, res) => {
 
 // POST /api/public/verify-customer (Public Verification by Username + Phone)
 app.post('/api/public/verify-customer', async (req, res) => {
+  if (!(await applyPublicLimit(res, 'verifyCustomer', 'VERIFY_CUSTOMER', buildRateLimitKey('VERIFY_CUSTOMER', req.clientIp)))) return;
   const { username, phone } = req.body;
   if (!username || !phone) {
     return res.status(400).json({ success: false, error: 'Username and registered phone number are required.' });
@@ -8245,6 +9360,10 @@ app.post('/api/public/verify-customer', async (req, res) => {
   if (cleanPhone.length < 5) {
     return res.status(400).json({ success: false, error: 'Please enter a valid phone number (at least 5 digits).' });
   }
+
+  // Hard per-identifier limit (username + phone) across all IPs to block account enumeration
+  const identifier = cleanUser + ':' + cleanPhone;
+  if (!(await applyPublicLimit(res, 'verifyCustomerIdentifier', 'VERIFY_CUSTOMER_IDENTIFIER', buildRateLimitKey('VERIFY_CUSTOMER_IDENTIFIER', '-', identifier)))) return;
 
   const allClients = memoryStore.users || [];
   const client = allClients.find(u => {
@@ -8286,6 +9405,7 @@ app.post('/api/public/verify-customer', async (req, res) => {
 
 // POST /api/public/tickets (Public Ticket Submission with Voice Audio & Speech Text)
 app.post('/api/public/tickets', async (req, res) => {
+  if (!(await applyPublicLimit(res, 'publicTickets', 'PUBLIC_TICKETS', buildRateLimitKey('PUBLIC_TICKETS', req.clientIp)))) return;
   const { username, phone, subject, description, priority, issueCategory, drive, serverName, audioBase64 } = req.body;
   
   if (!username || !phone) {
@@ -8326,7 +9446,7 @@ app.post('/api/public/tickets', async (req, res) => {
     serverName: resolvedServer,
     drive: resolvedDrive,
     issueCategory: issueCategory || 'Customer Support',
-    subject: subject || (voiceNoteUrl ? '🎙️ Voice Note Support Request' : 'Customer Support Request'),
+    subject: subject || (voiceNoteUrl ? 'ðŸŽ™ï¸ Voice Note Support Request' : 'Customer Support Request'),
     description: description || '',
     priority: priority || 'MEDIUM',
     status: 'OPEN',
@@ -8347,14 +9467,14 @@ app.post('/api/public/tickets', async (req, res) => {
   if (isMysqlConnected && dbPool) {
     try {
       await dbPool.query(
-        `INSERT INTO \`support_tickets\` (id, clientId, clientName, company, customerPhone, customerEmail, serverId, serverName, drive, issueCategory, subject, description, priority, status, assignedTo, assignedToEmail, resolutionNotes, voiceNoteUrl, createdBy, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO \`support_tickets\` (id, clientId, clientName, company, customerPhone, customerEmail, serverId, serverName, drive, issueCategory, subject, description, priority, status, assignedTo, assignedToEmail, resolutionNotes, voiceNoteUrl, createdBy, source, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           newTicket.id, newTicket.clientId, newTicket.clientName, newTicket.company,
           newTicket.customerPhone, newTicket.customerEmail, newTicket.serverId, newTicket.serverName,
           newTicket.drive, newTicket.issueCategory, newTicket.subject, newTicket.description,
           newTicket.priority, newTicket.status, newTicket.assignedTo, newTicket.assignedToEmail,
-          newTicket.resolutionNotes, newTicket.voiceNoteUrl, newTicket.createdBy, newTicket.createdAt
+          newTicket.resolutionNotes, newTicket.voiceNoteUrl, newTicket.createdBy, newTicket.source || '', newTicket.createdAt
         ]
       );
     } catch (e) {
@@ -8362,7 +9482,7 @@ app.post('/api/public/tickets', async (req, res) => {
     }
   }
 
-  logAudit('Customer Portal', 'CUSTOMER', 'PUBLIC_TICKET_RAISED', newTicket.id, `Customer ${company} raised ticket ${newTicket.id} via Support Portal`, req.ip);
+  logAudit('Customer Portal', 'CUSTOMER', 'PUBLIC_TICKET_RAISED', newTicket.id, `Customer ${company} raised ticket ${newTicket.id} via Support Portal`, req.clientIp);
 
   // Email Notification to Customer
   if (newTicket.customerEmail) {
@@ -8371,16 +9491,16 @@ app.post('/api/public/tickets', async (req, res) => {
       subject: `[${newTicket.id}] Support Ticket Received: ${newTicket.subject}`,
       htmlContent: `
         <div style="font-family: sans-serif; background: #0b0f19; color: #ffffff; padding: 22px; border-radius: 10px; max-width: 560px; margin: auto; border: 1px solid rgba(56, 189, 248, 0.3);">
-          <h2 style="color: #38bdf8; margin: 0 0 10px 0;">🎫 Support Ticket Received [${newTicket.id}]</h2>
+          <h2 style="color: #38bdf8; margin: 0 0 10px 0;">ðŸŽ« Support Ticket Received [${newTicket.id}]</h2>
           <p style="color: #cbd5e1; font-size: 14px;">Dear <strong>${newTicket.company}</strong>,</p>
           <p style="color: #94a3b8; font-size: 13px;">We have received your support ticket. Our technical engineering staff will attend to it shortly.</p>
           <div style="background: rgba(15,23,42,0.8); padding: 12px; border-radius: 8px; font-size: 13px; color: #cbd5e1; margin: 15px 0;">
             <p style="margin: 4px 0;"><strong>Ticket ID:</strong> <span style="color: #38bdf8;">${newTicket.id}</span></p>
             <p style="margin: 4px 0;"><strong>Issue Subject:</strong> ${newTicket.subject}</p>
             <p style="margin: 4px 0;"><strong>Server / Drive:</strong> ${newTicket.serverName} (${newTicket.drive})</p>
-            ${newTicket.voiceNoteUrl ? '<p style="margin: 4px 0; color: #34d399;">🎙️ <em>Voice Message Attached</em></p>' : ''}
+            ${newTicket.voiceNoteUrl ? '<p style="margin: 4px 0; color: #34d399;">ðŸŽ™ï¸ <em>Voice Message Attached</em></p>' : ''}
           </div>
-          <p style="color: #64748b; font-size: 12px;">Innovation Web Works • Support Helpdesk</p>
+          <p style="color: #64748b; font-size: 12px;">Innovation Web Works â€¢ Support Helpdesk</p>
         </div>
       `
     });
@@ -8432,15 +9552,15 @@ app.put('/api/tickets/:id', requireAuth, async (req, res) => {
     }
   }
 
-  logAudit(req.employee.name, req.employee.role, isNowResolved ? 'TICKET_RESOLVED' : 'TICKET_UPDATED', id, `Updated ticket ${id} -> ${updatedTicket.status}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, isNowResolved ? 'TICKET_RESOLVED' : 'TICKET_UPDATED', id, `Updated ticket ${id} -> ${updatedTicket.status}`, req.clientIp);
 
   // AUTOMATED RESOLUTION EMAIL DISPATCH
   if (isNowResolved && updatedTicket.customerEmail) {
     const resolutionEmailHtml = `
       <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #ffffff; padding: 24px; border-radius: 12px; max-width: 580px; margin: auto; border: 1px solid rgba(16, 185, 129, 0.3);">
         <div style="border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 14px; margin-bottom: 16px;">
-          <h2 style="color: #34d399; margin: 0; font-size: 20px;">✅ Support Ticket Resolved [${updatedTicket.id}]</h2>
-          <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Innovation Web Works • VPS Operations & Support</div>
+          <h2 style="color: #34d399; margin: 0; font-size: 20px;">âœ… Support Ticket Resolved [${updatedTicket.id}]</h2>
+          <div style="font-size: 12px; color: #94a3b8; margin-top: 4px;">Innovation Web Works â€¢ VPS Operations & Support</div>
         </div>
         
         <p style="color: #e2e8f0; font-size: 15px; margin-top: 0;">Hello <strong>${updatedTicket.company}</strong>,</p>
@@ -8452,7 +9572,7 @@ app.put('/api/tickets/:id', requireAuth, async (req, res) => {
         </div>
 
         <div style="font-size: 13px; color: #cbd5e1; margin-bottom: 12px;">
-          <strong>Server / Drive:</strong> ${updatedTicket.serverName || 'VPS'} • ${updatedTicket.drive}<br>
+          <strong>Server / Drive:</strong> ${updatedTicket.serverName || 'VPS'} â€¢ ${updatedTicket.drive}<br>
           <strong>Resolved By:</strong> ${updatedTicket.assignedTo || 'Technical Support'}
         </div>
 
@@ -8486,7 +9606,7 @@ app.delete('/api/tickets/:id', requireAdmin, async (req, res) => {
     } catch (e) {}
   }
 
-  logAudit(req.employee.name, req.employee.role, 'TICKET_DELETED', id, `Deleted support ticket ${id}`, req.ip);
+  logAudit(req.employee.name, req.employee.role, 'TICKET_DELETED', id, `Deleted support ticket ${id}`, req.clientIp);
 
   res.json({ success: true, message: 'Ticket deleted successfully.' });
 });
@@ -8552,7 +9672,7 @@ app.post('/api/tickets/verify-user', requireAuth, async (req, res) => {
       success: true,
       found: false,
       status: 'SERVER_MISMATCH',
-      user: matchingUsers[0],
+      user: toPublicClient(matchingUsers[0]),
       message: `User '${username}' is registered on ${actualIp}, not on Server IP ${serverIp || matchedServer.ipAddress}!`
     });
   }
@@ -8566,8 +9686,8 @@ app.post('/api/tickets/verify-user', requireAuth, async (req, res) => {
     success: true,
     found: true,
     driveMatches,
-    user: validUser,
-    matchedServer: matchedServer || { id: validUser.serverId, name: validUser.serverId, ipAddress: validUser.serverId },
+    user: toPublicClient(validUser),
+    matchedServer: toPublicServer(matchedServer || { id: validUser.serverId, name: validUser.serverId, ipAddress: validUser.serverId }),
     message: driveMatches 
       ? `Verified: User '${validUser.username}' (${validUser.company}) is active on ${validUser.drive}.`
       : `Drive Mismatch: In database, '${validUser.username}' is assigned to '${validUser.drive}', but you have '${drive}' selected.`
@@ -8591,16 +9711,16 @@ function decodeHtmlEntities(str) {
 function preProcessDevanagariIT(text) {
   let str = text;
   const itPreMap = [
-    { regex: /टेली|टैली|तेली/g, rep: 'Tally' },
-    { regex: /क्लाउड|क्लाउड़|क्लाउद/g, rep: 'Cloud' },
-    { regex: /नॉट|नोट/g, rep: 'not' },
-    { regex: /सोइंग|शोइंग/g, rep: 'showing' },
-    { regex: /एजुकेशन\s*मोड|एजुकेशनल\s*मोड/g, rep: 'Educational Mode' },
-    { regex: /डिस्\s*connecting\s*ेड|डिस्कनेक्टेड/g, rep: 'disconnected' },
-    { regex: /यूज़र\s*(?:सोचा|सत्र)/g, rep: 'User session' },
-    { regex: /साइन\s*ऑफ/g, rep: 'sign off' },
-    { regex: /बैकएंड/g, rep: 'backend' },
-    { regex: /इशू\s*(?:टेक्स्ट|फिक्स)/g, rep: 'issue resolved' }
+    { regex: /à¤Ÿà¥‡à¤²à¥€|à¤Ÿà¥ˆà¤²à¥€|à¤¤à¥‡à¤²à¥€/g, rep: 'Tally' },
+    { regex: /à¤•à¥à¤²à¤¾à¤‰à¤¡|à¤•à¥à¤²à¤¾à¤‰à¥œ|à¤•à¥à¤²à¤¾à¤‰à¤¦/g, rep: 'Cloud' },
+    { regex: /à¤¨à¥‰à¤Ÿ|à¤¨à¥‹à¤Ÿ/g, rep: 'not' },
+    { regex: /à¤¸à¥‹à¤‡à¤‚à¤—|à¤¶à¥‹à¤‡à¤‚à¤—/g, rep: 'showing' },
+    { regex: /à¤à¤œà¥à¤•à¥‡à¤¶à¤¨\s*à¤®à¥‹à¤¡|à¤à¤œà¥à¤•à¥‡à¤¶à¤¨à¤²\s*à¤®à¥‹à¤¡/g, rep: 'Educational Mode' },
+    { regex: /à¤¡à¤¿à¤¸à¥\s*connecting\s*à¥‡à¤¡|à¤¡à¤¿à¤¸à¥à¤•à¤¨à¥‡à¤•à¥à¤Ÿà¥‡à¤¡/g, rep: 'disconnected' },
+    { regex: /à¤¯à¥‚à¤œà¤¼à¤°\s*(?:à¤¸à¥‹à¤šà¤¾|à¤¸à¤¤à¥à¤°)/g, rep: 'User session' },
+    { regex: /à¤¸à¤¾à¤‡à¤¨\s*à¤‘à¤«/g, rep: 'sign off' },
+    { regex: /à¤¬à¥ˆà¤•à¤à¤‚à¤¡/g, rep: 'backend' },
+    { regex: /à¤‡à¤¶à¥‚\s*(?:à¤Ÿà¥‡à¤•à¥à¤¸à¥à¤Ÿ|à¤«à¤¿à¤•à¥à¤¸)/g, rep: 'issue resolved' }
   ];
 
   for (const item of itPreMap) {
@@ -8610,90 +9730,34 @@ function preProcessDevanagariIT(text) {
 }
 
 // POST /api/ai/translate (Requires Auth)
+// Uses the official Google Cloud Translation API via lib/translate.js. Always HTTP 200;
+// falls back to the original text when translation is disabled, skipped or failed.
 app.post('/api/ai/translate', requireAuth, async (req, res) => {
-  const { text } = req.body;
+  const { text } = req.body || {};
   if (!text || typeof text !== 'string') {
-    return res.json({ success: true, translatedText: '' });
+    return res.json({ success: true, translatedText: '', translateStatus: 'skipped' });
   }
 
   const raw = text.trim();
-  if (!raw) return res.json({ success: true, translatedText: '' });
+  if (!raw) return res.json({ success: true, translatedText: '', translateStatus: 'skipped' });
 
-  // 1. Primary: Google Translate Neural Engine (dict-chrome-ex / clients5)
-  try {
-    const preProcessed = preProcessDevanagariIT(raw);
-    const googleUrl = `https://clients5.google.com/translate_a/t?client=dict-chrome-ex&sl=auto&tl=en&q=${encodeURIComponent(preProcessed)}`;
-    const googleRes = await fetch(googleUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
-    });
-    if (googleRes.ok) {
-      const data = await googleRes.json();
-      let translated = '';
-      if (Array.isArray(data)) {
-        translated = data.map(item => Array.isArray(item) ? item[0] : item).join(' ').trim();
-      } else if (typeof data === 'string') {
-        translated = data.trim();
-      }
+  const preProcessed = preProcessDevanagariIT(raw);
+  const result = await translateText({ text: preProcessed, config });
 
-      if (translated) {
-        translated = decodeHtmlEntities(translated)
-          .replace(/\b(drive\s*([a-z]))\b/gi, (m, p1, p2) => `Drive ${p2.toUpperCase()}`)
-          .trim();
-
-        if (translated.length > 0) {
-          translated = translated.charAt(0).toUpperCase() + translated.slice(1);
-          if (!/[.!?]$/.test(translated)) translated += '.';
-        }
-
-        return res.json({ success: true, translatedText: translated, source: 'google_neural' });
-      }
-    }
-  } catch (e) {
-    console.error("Google Neural Translate error in backend:", e.message);
+  if (result.status !== 'ok') {
+    return res.json({ success: true, translatedText: raw, translateStatus: result.status });
   }
 
-  // 2. Secondary: Google Translate Mobile Web Mirror
-  try {
-    const preProcessed = preProcessDevanagariIT(raw);
-    const url = `https://translate.google.com/m?sl=auto&tl=en&q=${encodeURIComponent(preProcessed)}`;
-    const googleRes = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1'
-      }
-    });
-    const html = await googleRes.text();
-    const match = html.match(/<div class="result-container">([\s\S]*?)<\/div>/);
-    if (match && match[1]) {
-      let translated = decodeHtmlEntities(match[1].trim());
-      translated = translated
-        .replace(/\b(drive\s*([a-z]))\b/gi, (m, p1, p2) => `Drive ${p2.toUpperCase()}`)
-        .trim();
+  let translated = decodeHtmlEntities(result.translatedText)
+    .replace(/\b(drive\s*([a-z]))\b/gi, (m, p1, p2) => `Drive ${p2.toUpperCase()}`)
+    .trim();
 
-      if (translated.length > 0) {
-        translated = translated.charAt(0).toUpperCase() + translated.slice(1);
-        if (!/[.!?]$/.test(translated)) translated += '.';
-      }
-
-      return res.json({ success: true, translatedText: translated, source: 'google_mobile' });
-    }
-  } catch (e) {
-    console.error("Google Mobile Translate error in backend:", e.message);
+  if (translated.length > 0) {
+    translated = translated.charAt(0).toUpperCase() + translated.slice(1);
+    if (!/[.!?]$/.test(translated)) translated += '.';
   }
 
-  // 3. Tertiary: MyMemory Multi-Language Fallback
-  try {
-    const memUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(raw)}&langpair=autodetect|en`;
-    const memRes = await fetch(memUrl);
-    const memJson = await memRes.json();
-    if (memJson && memJson.responseData && memJson.responseData.translatedText) {
-      let tr = decodeHtmlEntities(memJson.responseData.translatedText.trim());
-      tr = tr.charAt(0).toUpperCase() + tr.slice(1);
-      if (!/[.!?]$/.test(tr)) tr += '.';
-      return res.json({ success: true, translatedText: tr, source: 'mymemory' });
-    }
-  } catch (e2) {}
-
-  res.json({ success: true, translatedText: raw, source: 'raw' });
+  res.json({ success: true, translatedText: translated || raw, translateStatus: translated ? 'ok' : 'failed' });
 });
 
 // MASTER MONTHLY EXPIRY MAILER DISPATCH (Admin Only)
@@ -8746,6 +9810,10 @@ app.post('/api/send-master-mail', requireAdmin, async (req, res) => {
 
 // FORGOT PASSWORD OTP ENDPOINTS WITH RATE LIMITING & MINIMUM PASSWORD LENGTH
 const otpStore = {};
+const OTP_GENERIC_RESPONSE = {
+  success: true,
+  message: 'If a matching account exists, a 6-digit security OTP has been dispatched to the registered email.'
+};
 
 app.post('/api/forgot-password/request-otp', async (req, res) => {
   const input = req.body.username || req.body.usernameOrEmail || req.body.email;
@@ -8753,18 +9821,16 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
     return res.status(400).json({ success: false, error: 'Username or Email is required' });
   }
 
-  const clientIp = req.ip || req.connection?.remoteAddress || '127.0.0.1';
+  const clientIp = req.clientIp || req.connection?.remoteAddress || '127.0.0.1';
   const inputLower = input.trim().toLowerCase();
   const rateLimitKey = `${clientIp}:${inputLower}`;
 
   // Rate Limiting: Max 3 OTP requests per 15 minutes
-  const rateCheck = checkRateLimit('otpRequest', rateLimitKey, 3, 15 * 60 * 1000);
-  if (!rateCheck.allowed) {
-    return res.status(429).json({
-      success: false,
-      error: `Too many password reset requests. Please wait ${rateCheck.retryAfterSeconds || 900} seconds before requesting a new OTP.`
-    });
-  }
+  const rateOk = await applyRateLimit(res, 'otpRequest', rateLimitKey, 3, 15 * 60 * 1000, {
+    checkRateLimit,
+    isProduction: config.isProduction
+  });
+  if (!rateOk) return;
 
   let matchedUser = (memoryStore.portalUsers || defaultPortalUsers).find(
     u => u.username.toLowerCase() === inputLower || (u.email && u.email.toLowerCase() === inputLower)
@@ -8784,35 +9850,34 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
 
   if (!matchedUser) {
     // Safe response to avoid username enumeration
-    return res.json({
-      success: true,
-      message: 'If a matching account exists, a 6-digit security OTP has been dispatched to the registered email.'
-    });
+    return res.json(OTP_GENERIC_RESPONSE);
   }
 
-  const targetEmail = matchedUser.email || 'mannk4811@gmail.com';
+  const targetEmail = typeof matchedUser.email === 'string' ? matchedUser.email.trim() : '';
+  if (!targetEmail || !targetEmail.includes('@')) {
+    console.warn(`[ForgotPassword] account "${matchedUser.username}" has no email; OTP not sent`);
+    return res.json(OTP_GENERIC_RESPONSE);
+  }
   const otpCode = Math.floor(100000 + Math.random() * 900000).toString();
-
-  otpStore[matchedUser.username.toLowerCase()] = {
-    otpCode,
-    email: targetEmail,
-    attempts: 0,
-    expiresAt: Date.now() + 10 * 60 * 1000
-  };
+  const otpKey = matchedUser.username.toLowerCase();
 
   try {
+    if (!process.env.SMTP_HOST || !process.env.SMTP_USER) {
+      throw new Error('SMTP is not configured');
+    }
+    const smtpPort = parseInt(process.env.SMTP_PORT || '587', 10);
     const transporter = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 587,
-      secure: false,
+      host: process.env.SMTP_HOST,
+      port: smtpPort,
+      secure: smtpPort === 465,
       auth: {
-        user: process.env.SMTP_USER || 'mannk4811@gmail.com',
-        pass: process.env.SMTP_PASS || ''
+        user: process.env.SMTP_USER,
+        pass: process.env.SMTP_PASS
       }
     });
 
     await transporter.sendMail({
-      from: `"Innovation Web Works Security" <mannk4811@gmail.com>`,
+      from: `"Innovation Web Works Security" <${process.env.SMTP_USER}>`,
       to: targetEmail,
       subject: `Your 6-Digit Password Reset OTP - ${otpCode}`,
       html: `<div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f172a; color: #ffffff; padding: 30px; border-radius: 12px; max-width: 500px; margin: auto; border: 1px solid rgba(255,255,255,0.1);">
@@ -8824,14 +9889,23 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
         <p style="color: #94a3b8; font-size: 12px; margin-bottom: 0;">This OTP is strictly confidential and expires in 10 minutes.</p>
       </div>`
     });
+
+    otpStore[otpKey] = {
+      otpCode,
+      email: targetEmail,
+      attempts: 0,
+      expiresAt: Date.now() + 10 * 60 * 1000
+    };
   } catch (e) {
-    console.error(`⚠️ Nodemailer error: ${e.message}`);
+    delete otpStore[otpKey];
+    console.error(`[ForgotPassword] OTP email failed: ${e.code || 'ERR'} ${e.message}`);
+    return res.status(502).json({ success: false, error: 'Unable to send the verification email. Please try again later.' });
   }
 
   const [namePart, domainPart] = targetEmail.split('@');
   const maskedEmail = namePart && namePart.length > 2
-    ? `${namePart.substring(0, 2)}***@${domainPart || 'gmail.com'}`
-    : `${namePart || 'em'}***@${domainPart || 'gmail.com'}`;
+    ? `${namePart.substring(0, 2)}***@${domainPart}`
+    : `${namePart || 'em'}***@${domainPart}`;
 
   res.json({
     success: true,
@@ -8852,6 +9926,10 @@ app.post('/api/forgot-password/reset-password', async (req, res) => {
   }
 
   const userLower = username.trim().toLowerCase();
+  if (!(await applyPublicLimit(res, 'resetPassword', 'RESET_PASSWORD', buildRateLimitKey('RESET_PASSWORD', req.clientIp)))) return;
+  if (!(await applyPublicLimit(res, 'resetPasswordUser', 'RESET_PASSWORD', buildRateLimitKey('RESET_PASSWORD', '-', userLower)))) return;
+  // OTP guess limit per username (counts every attempt, independent of the per-OTP attempts counter)
+  if (!(await applyPublicLimit(res, 'otpVerifyUser', 'OTP_VERIFY', buildRateLimitKey('OTP_VERIFY', '-', userLower)))) return;
   const record = otpStore[userLower];
   if (!record) {
     return res.status(400).json({ success: false, error: 'No OTP request found for this account or OTP expired.' });
@@ -8909,17 +9987,78 @@ app.post('/api/forgot-password/reset-password', async (req, res) => {
     }
   }
 
-  logAudit(username, 'EMPLOYEE', 'PASSWORD_RESET', username, 'Password reset via email OTP verification. All active sessions invalidated.', req.ip);
+  logAudit(username, 'EMPLOYEE', 'PASSWORD_RESET', username, 'Password reset via email OTP verification. All active sessions invalidated.', req.clientIp);
 
   res.json({ success: true, message: 'Password reset successfully. All previous sessions terminated.' });
 });
 
-const isTest = process.env.TEST_MODE === '1' || process.env.NODE_ENV === 'test' || (process.argv[1] && process.argv[1].includes('test_'));
-if (!isTest) {
-  app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`🚀 Secure Production VPS Backend Server running on port ${PORT} (Bound to 0.0.0.0)`);
-    await initMySQLDatabase();
-  });
+// Final error handler (Req 11.2): DbUnavailableError -> 503; anything else -> generic 500 with no stack or internals.
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err instanceof JobParamError) {
+    return res.status(400).json({ success: false, error: 'Invalid request parameters' });
+  }
+  if (err instanceof DbUnavailableError) {
+    console.error(`[DB] ${req.method} ${req.path}: database unavailable (${err.causeCode || 'unknown'})`);
+    return res.status(503).json({ error: 'Database unavailable' });
+  }
+  console.error(`[Error] ${req.method} ${req.path}: ${err && err.name ? err.name : 'Error'}`);
+  return res.status(500).json({ error: 'Internal server error' });
+});
+
+// Startup work that must finish before the server accepts requests (Req 9.4, 12.1, 18.3).
+// deps: { config, initDatabase, importLegacy, sweepJobs } are optional overrides for tests.
+async function bootstrap(deps = {}) {
+  const cfg = deps.config || config;
+  const initDatabase = deps.initDatabase || initMySQLDatabase;
+  const importLegacy = deps.importLegacy || runLegacyEntityImport;
+  const sweepJobs = deps.sweepJobs || (() => sweepTerminalJobs(provisionJobDeps()));
+  const failStartup = (msg) => {
+    console.error(`[DB] ${msg}. Refusing to start in production without ALLOW_JSON_FALLBACK=1; database.json was not touched.`);
+    process.exit(1);
+  };
+  // Req 11.1: hard 30 s startup deadline in strict mode.
+  const deadline = strictMysql
+    ? setTimeout(() => failStartup(`MySQL is unreachable (startup deadline of ${STARTUP_DB_DEADLINE_MS / 1000}s exceeded)`), STARTUP_DB_DEADLINE_MS)
+    : null;
+  try {
+    await initDatabase();
+  } catch (e) {
+    console.error('[DB] init failed:', e && e.message);
+    if (strictMysql) failStartup('MySQL initialization failed');
+  }
+  if (strictMysql && !isMysqlConnected) failStartup('MySQL is unreachable');
+  if (deadline) clearTimeout(deadline);
+  if (cfg.isProduction && cfg.allowJsonFallback) {
+    console.warn('[Config] JSON fallback is enabled in Production_Mode (ALLOW_JSON_FALLBACK=1)');
+  }
+  console.log(`Storage mode: ${isMysqlConnected ? 'MySQL' : 'JSON fallback'}`);
+  await importLegacy();
+  try {
+    await sweepJobs();
+  } catch (e) {
+    console.error('[Passwords] boot sweep failed:', e && e.message);
+  }
 }
 
-export { app, requireAuth, requireAdmin };
+const isTest = process.env.TEST_MODE === '1' || process.env.NODE_ENV === 'test' || (process.argv[1] && process.argv[1].includes('test_'));
+if (!isTest) {
+  bootstrap().then(() => {
+    const server = app.listen(config.port, config.host);
+    server.once('listening', () => {
+      const addr = server.address();
+      const shown = addr && typeof addr === 'object' ? `${addr.address}:${addr.port}` : `${config.host}:${config.port}`;
+      console.log(`ðŸš€ Secure Production VPS Backend Server listening on ${shown}`);
+      auditDefaultPortalPasswords();
+    });
+    server.once('error', (err) => {
+      console.error(`[Server] Failed to listen on ${config.host}:${config.port}: ${err && err.code ? err.code + ' ' : ''}${err && err.message}`);
+      process.exit(1);
+    });
+  }).catch((err) => {
+    console.error('[Server] Startup failed:', err && err.message);
+    process.exit(1);
+  });
+}
+export { app, bootstrap, requireAuth, requireAdmin, initMySQLDatabase };

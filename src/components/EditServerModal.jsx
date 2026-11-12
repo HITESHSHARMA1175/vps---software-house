@@ -1,6 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { X, Server, ShieldCheck, Eye, EyeOff, Sparkles, Edit3, Check, RotateCcw } from 'lucide-react';
+import { KeyRound } from 'lucide-react';
 import { generateDriveRange } from './AddServerModal';
+import AgentKeyPanel from './AgentKeyPanel';
+import { useAuth, API_BASE } from '../contexts/AuthContext';
 
 export default function EditServerModal({ isOpen, onClose, server, onSaveServer }) {
   // Drive Modes: 'KEEP_EXISTING' (Default - Keep exact drives), 'RANGE' (Auto Range), 'CUSTOM' (Custom List)
@@ -26,6 +29,65 @@ export default function EditServerModal({ isOpen, onClose, server, onSaveServer 
   });
 
   const [showPassword, setShowPassword] = useState(false);
+
+  const { currentUser, authFetch } = useAuth();
+  const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
+  const [isRotating, setIsRotating] = useState(false);
+  const [rotateResult, setRotateResult] = useState(null); // { agentKey, installerUrl } | { error }
+
+  // Drop any displayed key when the modal switches server or closes
+  useEffect(() => {
+    setRotateResult(null);
+  }, [server?.id, isOpen]);
+
+  const [graceInput, setGraceInput] = useState('0');
+  const [graceError, setGraceError] = useState('');
+
+  useEffect(() => {
+    setGraceInput('0');
+    setGraceError('');
+  }, [server?.id, isOpen]);
+
+  const parseGrace = (raw) => {
+    const s = String(raw).trim();
+    if (!/^\d+$/.test(s)) return null;
+    const n = Number(s);
+    return Number.isInteger(n) && n >= 0 && n <= 1440 ? n : null;
+  };
+
+  const handleRotateKey = async () => {
+    const graceMinutes = parseGrace(graceInput);
+    if (graceMinutes === null) {
+      setGraceError('Grace period must be a whole number between 0 and 1440 minutes.');
+      return;
+    }
+    setGraceError('');
+    const graceNote = graceMinutes > 0
+      ? `The current key keeps working for ${graceMinutes} more minute(s).`
+      : 'The current key stops working immediately.';
+    if (!window.confirm(`Rotate the agent key for "${server.name}"?\n\n${graceNote} The agent on this server must be reinstalled with the new key.`)) {
+      return;
+    }
+    setIsRotating(true);
+    setRotateResult(null);
+    try {
+      const res = await authFetch(`${API_BASE}/servers/${encodeURIComponent(server.id)}/rotate-agent-key`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ graceMinutes })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.agentKey) {
+        setRotateResult({ error: `Key rotation failed: ${data.error || `request failed (HTTP ${res.status})`}` });
+      } else {
+        setRotateResult({ agentKey: data.agentKey, installerUrl: data.installerUrl || '', previousKeyExpiresAt: data.previousKeyExpiresAt || null });
+      }
+    } catch (e) {
+      setRotateResult({ error: `Key rotation failed: ${e.message || 'network error'}` });
+    } finally {
+      setIsRotating(false);
+    }
+  };
 
   const alphabetList = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i));
   const generatedRangeDrives = generateDriveRange(startLetter, endLetter, drivePrefix);
@@ -156,6 +218,7 @@ export default function EditServerModal({ isOpen, onClose, server, onSaveServer 
                   type={showPassword ? 'text' : 'password'}
                   className="form-input"
                   style={{ width: '100%', paddingRight: '2.5rem' }}
+                  placeholder="Leave blank to keep current password"
                   value={formData.superClientPass}
                   onChange={e => setFormData({ ...formData, superClientPass: e.target.value })}
                 />
@@ -344,6 +407,67 @@ export default function EditServerModal({ isOpen, onClose, server, onSaveServer 
               </div>
             )}
           </div>
+
+          {isSuperAdmin && (
+            <div className="glass-card" style={{ padding: '1rem', marginTop: '1.25rem', border: '1px solid rgba(245, 158, 11, 0.3)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '0.75rem' }}>
+                <div>
+                  <strong style={{ fontSize: '0.9rem', color: '#fbbf24', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                    <KeyRound size={16} /> Agent key
+                  </strong>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '4px' }}>
+                    Rotate to revoke the current key. The new key is shown once.
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-secondary"
+                  style={{ color: '#fbbf24', borderColor: 'rgba(245, 158, 11, 0.4)' }}
+                  disabled={isRotating}
+                  onClick={handleRotateKey}
+                >
+                  {isRotating ? 'Rotating...' : 'Rotate agent key'}
+                </button>
+              </div>
+              <div style={{ marginTop: '0.75rem' }}>
+                <label htmlFor="rotate-grace-minutes" style={{ display: 'block', fontSize: '0.78rem', color: 'var(--text-muted)', marginBottom: '4px' }}>
+                  Grace period (minutes, 0 to 1440)
+                </label>
+                <input
+                  id="rotate-grace-minutes"
+                  type="number"
+                  className="form-control"
+                  min={0}
+                  max={1440}
+                  step={1}
+                  value={graceInput}
+                  disabled={isRotating}
+                  aria-invalid={graceError ? 'true' : 'false'}
+                  aria-describedby={graceError ? 'rotate-grace-error' : undefined}
+                  onChange={(e) => { setGraceInput(e.target.value); setGraceError(''); }}
+                  style={{ maxWidth: '140px' }}
+                />
+                {graceError && (
+                  <div id="rotate-grace-error" role="alert" style={{ marginTop: '4px', fontSize: '0.75rem', color: '#fca5a5' }}>{graceError}</div>
+                )}
+              </div>
+              {rotateResult && (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <AgentKeyPanel
+                    agentKey={rotateResult.agentKey}
+                    installerUrl={rotateResult.installerUrl}
+                    error={rotateResult.error}
+                    onClose={() => setRotateResult(null)}
+                  />
+                  {rotateResult.agentKey && rotateResult.previousKeyExpiresAt && !Number.isNaN(new Date(rotateResult.previousKeyExpiresAt).getTime()) && (
+                    <div role="status" style={{ marginTop: '8px', fontSize: '0.78rem', color: '#fbbf24' }}>
+                      The previous key keeps working until {new Date(rotateResult.previousKeyExpiresAt).toLocaleString()}.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '0.75rem', marginTop: '1.5rem' }}>
             <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>

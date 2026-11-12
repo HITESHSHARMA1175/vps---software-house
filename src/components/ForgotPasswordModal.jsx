@@ -1,7 +1,40 @@
 import React, { useState } from 'react';
-import { X, Key, Mail, ShieldAlert, CheckCircle2, ArrowRight, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
+import { Eye, EyeOff, X, Key, Mail, ShieldAlert, CheckCircle2, ArrowRight, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
+
+function PasswordToggle({ shown, onToggle }) {
+  return (
+    <button
+      type="button"
+      aria-label={shown ? 'Hide password' : 'Show password'}
+      aria-pressed={shown}
+      onClick={onToggle}
+      onFocus={e => { e.currentTarget.style.boxShadow = '0 0 0 2px #38bdf8'; }}
+      onBlur={e => { e.currentTarget.style.boxShadow = 'none'; }}
+      style={{
+        position: 'absolute',
+        right: '0.5rem',
+        top: '50%',
+        transform: 'translateY(-50%)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '6px',
+        background: 'none',
+        border: 'none',
+        borderRadius: '6px',
+        color: '#64748b',
+        cursor: 'pointer'
+      }}
+    >
+      {shown ? <EyeOff size={16} /> : <Eye size={16} />}
+    </button>
+  );
+}
 
 export default function ForgotPasswordModal({ onClose, onSuccess }) {
+  // Visibility toggles live in this component, so they reset to hidden whenever it unmounts/closes.
+  const [showNew, setShowNew] = useState(false);
+  const [showConfirm, setShowConfirm] = useState(false);
   const [step, setStep] = useState(1); // 1: Request OTP, 2: Enter OTP & New Password
   const [usernameOrEmail, setUsernameOrEmail] = useState('');
   const [targetUsername, setTargetUsername] = useState('');
@@ -27,15 +60,25 @@ export default function ForgotPasswordModal({ onClose, onSuccess }) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ usernameOrEmail })
       });
-      const data = await res.json();
+      let data = {};
+      try {
+        data = (await res.json()) || {};
+      } catch (_) {
+        data = {};
+      }
 
-      if (data.success) {
-        setTargetUsername(data.username);
-        setMaskedEmail(data.maskedEmail);
+      if (res.ok && data.success) {
+        const masked = typeof data.maskedEmail === 'string' ? data.maskedEmail.trim() : '';
+        setTargetUsername(data.username || usernameOrEmail.trim());
+        setMaskedEmail(masked);
         setStep(2);
-        setSuccessMsg(`Security OTP successfully sent to ${data.maskedEmail}!`);
+        setSuccessMsg(
+          masked
+            ? `Security OTP sent to ${masked}.`
+            : (data.message || 'If a matching account exists, a verification code has been sent.')
+        );
       } else {
-        setErrorMsg(data.error || 'Failed to request OTP');
+        setErrorMsg(data.error || data.message || 'Failed to request OTP');
       }
     } catch (err) {
       setErrorMsg('Network error. Please try again.');
@@ -179,7 +222,11 @@ export default function ForgotPasswordModal({ onClose, onSuccess }) {
             }}>
               <div>Account: <strong style={{ color: '#ffffff' }}>{targetUsername}</strong></div>
               <div style={{ fontSize: '0.78rem', color: '#94a3b8', marginTop: '3px' }}>
-                🔒 6-Digit OTP sent to your verified email (<strong>{maskedEmail}</strong>). Please check your inbox or spam folder.
+                {maskedEmail ? (
+                  <>🔒 6-Digit OTP sent to your verified email (<strong>{maskedEmail}</strong>). Please check your inbox or spam folder.</>
+                ) : (
+                  <>🔒 If a matching account exists, a 6-digit OTP has been sent to its verified email. Please check your inbox or spam folder.</>
+                )}
               </div>
             </div>
 
@@ -203,30 +250,36 @@ export default function ForgotPasswordModal({ onClose, onSuccess }) {
               <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <Lock size={14} color="#38bdf8" /> New Password
               </label>
-              <input
-                type="password"
-                className="form-input"
-                required
-                placeholder="Enter new password"
-                value={newPassword}
-                onChange={e => setNewPassword(e.target.value)}
-                style={{ backgroundColor: '#070913' }}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  type={showNew ? 'text' : 'password'}
+                  className="form-input"
+                  required
+                  placeholder="Enter new password"
+                  value={newPassword}
+                  onChange={e => setNewPassword(e.target.value)}
+                  style={{ backgroundColor: '#070913', paddingRight: '2.75rem' }}
+                />
+                <PasswordToggle shown={showNew} onToggle={() => setShowNew(v => !v)} />
+              </div>
             </div>
 
             <div className="form-group" style={{ marginBottom: '1.25rem' }}>
               <label className="form-label" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                 <Lock size={14} color="#38bdf8" /> Confirm New Password
               </label>
-              <input
-                type="password"
-                className="form-input"
-                required
-                placeholder="Confirm new password"
-                value={confirmPassword}
-                onChange={e => setConfirmPassword(e.target.value)}
-                style={{ backgroundColor: '#070913' }}
-              />
+              <div style={{ position: 'relative' }}>
+                <input
+                  type={showConfirm ? 'text' : 'password'}
+                  className="form-input"
+                  required
+                  placeholder="Confirm new password"
+                  value={confirmPassword}
+                  onChange={e => setConfirmPassword(e.target.value)}
+                  style={{ backgroundColor: '#070913', paddingRight: '2.75rem' }}
+                />
+                <PasswordToggle shown={showConfirm} onToggle={() => setShowConfirm(v => !v)} />
+              </div>
             </div>
 
             <div style={{ display: 'flex', gap: '0.75rem', justifyContent: 'space-between', alignItems: 'center' }}>

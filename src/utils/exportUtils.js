@@ -1,4 +1,5 @@
 import { getDaysRemaining } from '../components/UserTable';
+import { API_BASE } from '../contexts/AuthContext';
 
 export function downloadVpsSubscriptionTemplate() {
   const rows = [
@@ -161,6 +162,54 @@ export function exportServerUserExcel(servers, users, targetServerId = 'ALL') {
   document.body.appendChild(link);
   link.click();
   document.body.removeChild(link);
+}
+
+/**
+ * SUPER_ADMIN-only export that includes client passwords. Calls the server route
+ * (POST /api/clients/export) with confirm: true; the server enforces the role,
+ * decrypts, and writes the audit entry. The caller must ask the user to confirm first.
+ * The existing exportServerUserExcel stays client-side and password-free.
+ */
+export async function exportServerUserWithPasswords(serverId) {
+  const body = { includePasswords: true, confirm: true };
+  if (serverId && serverId !== 'ALL') body.serverId = serverId;
+
+  const res = await fetch(`${API_BASE}/clients/export`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify(body)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || `Export failed (HTTP ${res.status})`);
+  }
+
+  const esc = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const header = ['Username', 'Password', 'Company Name', 'Server ID', 'Drive Onboard', 'Registration Date', 'Renewal Expiry', 'Sales Agent', 'Phone', 'Email', 'Notes'];
+  const lines = [
+    'SOFTWARE HOUSE - CLIENT EXPORT WITH PASSWORDS (CONFIDENTIAL)',
+    `Generated Date: ${new Date().toISOString().split('T')[0]}`,
+    '',
+    header.map(esc).join(',')
+  ];
+  (data.clients || []).forEach(u => {
+    lines.push([
+      u.username, u.password, u.company, u.serverId, u.drive, u.billDate,
+      u.expiryDate, u.salesAgent, u.customerPhone, u.customerEmail, u.notes
+    ].map(esc).join(','));
+  });
+
+  const blob = new Blob(['\uFEFF', lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `SoftwareHouse_Clients_With_Passwords_${new Date().toISOString().split('T')[0]}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  URL.revokeObjectURL(url);
+  return data.count ?? (data.clients || []).length;
 }
 
 export function exportDailyUserActivityExcel(records, targetDate, serverFilterName = 'All VPS Servers') {

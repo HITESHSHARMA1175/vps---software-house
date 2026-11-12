@@ -1,12 +1,24 @@
 param (
     [Parameter(Mandatory=$false)]
-    [string]$ServerId = ""
+    [string]$ServerId = "",
+
+    # Per-server Agent_Key. The portal embeds it when it generates the installer for a server.
+    # Empty = generic auto-detect install, which only works while AGENT_AUTH_MODE=warn (Open Issue 1).
+    [Parameter(Mandatory=$false)]
+    [string]$AgentKey = ""
 )
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $ErrorActionPreference = "Stop"
 
 $portalBase = "https://vps.innovationwebworks.in"
+
+# Validate the key format; never print the key value anywhere.
+$AgentKey = ("$AgentKey").Trim()
+if ($AgentKey -and $AgentKey -notmatch '^ak_[A-Za-z0-9_-]{43}$') {
+    Write-Host " [!] Supplied agent key has an invalid format and will be ignored." -ForegroundColor Yellow
+    $AgentKey = ""
+}
 
 Write-Host "`n==========================================================================" -ForegroundColor Cyan
 Write-Host "   INNOVATION VPS AGENT - UNIVERSAL 1-CLICK BOOTSTRAP INSTALLER          " -ForegroundColor Green
@@ -33,6 +45,7 @@ if (-not $ServerId -or $ServerId -eq "auto" -or $ServerId -eq "srv-node-1") {
     Write-Host " [*] Auto-detecting VPS network identity and server node..." -ForegroundColor Gray
     try {
         $wcDetect = New-Object System.Net.WebClient
+        if ($AgentKey) { $wcDetect.Headers.Add("X-Agent-Key", $AgentKey) }
         $detectJson = $wcDetect.DownloadString("$portalBase/api/agent/detect-server")
         if ($detectJson) {
             $det = $detectJson | ConvertFrom-Json
@@ -69,6 +82,49 @@ if (-not (Test-Path $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
+# Write agent-config.json (serverId, portalBase, agentKey) and restrict it to SYSTEM + Administrators.
+$configPath = Join-Path $dir "agent-config.json"
+
+function Set-AgentConfigAcl {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+    & icacls.exe $Path /inheritance:r /grant:r "SYSTEM:(F)" "Administrators:(F)" *>$null
+    if ($LASTEXITCODE -ne 0) {
+        # Localized Windows: fall back to well-known SIDs (SYSTEM, BUILTIN\Administrators)
+        & icacls.exe $Path /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" *>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host " [!] Could not restrict permissions on agent-config.json" -ForegroundColor Yellow
+        }
+    }
+}
+
+try {
+    $cfg = @{}
+    if (Test-Path $configPath) {
+        try {
+            $existing = Get-Content $configPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            foreach ($p in $existing.PSObject.Properties) { $cfg[$p.Name] = $p.Value }
+        } catch {}
+    }
+    $cfg["serverId"] = "$ServerId"
+    $cfg["portalBase"] = "$portalBase"
+    if ($AgentKey) { $cfg["agentKey"] = $AgentKey }          # a new key replaces the old one
+    elseif (-not $cfg.ContainsKey("agentKey")) { $cfg["agentKey"] = "" }  # keep an existing key otherwise
+
+    # Create the file and lock it down BEFORE the key is written, so it is never world-readable.
+    if (-not (Test-Path $configPath)) { New-Item -ItemType File -Path $configPath -Force | Out-Null }
+    Set-AgentConfigAcl $configPath
+    [IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Set-AgentConfigAcl $configPath
+
+    if ($cfg["agentKey"]) {
+        Write-Host " [+] Agent key saved to agent-config.json (SYSTEM + Administrators only)" -ForegroundColor Green
+    } else {
+        Write-Host " [!] No agent key supplied. Use the per-server installer; a keyless agent works only while the portal runs in warn mode." -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host " [!] Could not write agent-config.json: $($_.Exception.Message)" -ForegroundColor Yellow
+}
 # Add Defender Exclusion early
 try {
     if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
@@ -143,6 +199,8 @@ try {
 if ($downloadedBinary -and (Test-Path $exeDest)) {
     Write-Host " [*] Installing Native Windows Service in services.msc..." -ForegroundColor Cyan
     & "$exeDest" -install -serverId "$ServerId" -portal "$portalBase"
+    # The service may rewrite the config during install; re-apply the lock-down.
+    Set-AgentConfigAcl $configPath
 
     # Fix any ImagePath quotes directly in Registry (eliminates Error 193: 0xc1)
     try {

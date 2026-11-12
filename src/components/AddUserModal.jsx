@@ -98,7 +98,8 @@ export default function AddUserModal({
       setFormData({
         clientType: initialUser.clientType || 'Shared',
         username: initialUser.username || '',
-        password: initialUser.password || generateStrongPassword(),
+        // Stored passwords are no longer sent to the browser; blank on edit keeps the current password
+        password: initialUser.password || '',
         company: initialUser.company || '',
         billDate: initialUser.billDate || '',
         expiryDate: initialUser.expiryDate || '',
@@ -426,8 +427,8 @@ export default function AddUserModal({
                   type={showUserPass ? 'text' : 'password'}
                   className="form-input"
                   style={{ width: '100%', paddingRight: '2.5rem' }}
-                  placeholder="e.g. UserPass#2026"
-                  required
+                  placeholder={initialUser ? 'Leave blank to keep current password' : 'e.g. UserPass#2026'}
+                  required={!initialUser}
                   value={formData.password}
                   onChange={e => setFormData(prev => ({ ...prev, password: e.target.value }))}
                 />

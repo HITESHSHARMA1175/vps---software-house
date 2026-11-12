@@ -25,6 +25,7 @@ import {
 import ServerPerformanceModal from '../ServerPerformanceModal';
 import AgentInstallModal from '../AgentInstallModal';
 import ActionsDropdown from '../ui/ActionsDropdown';
+import AgentKeyRolloutPanel from '../AgentKeyRolloutPanel';
 import './VpsView.css';
 
 const clampPercent = (value) => Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
@@ -272,7 +273,8 @@ export default function VpsView({
       serverId: server.id,
       company: server.name,
       username: server.superClientUser || 'Superclient',
-      password: server.superClientPass || 'Pass#123',
+      password: '', // never sent to the browser; SUPER_ADMIN reveals it on demand via the backend
+      isServerAccount: true,
       drive: 'Master Node',
       expiryDate: '2099-12-31'
     };
@@ -343,6 +345,8 @@ export default function VpsView({
           <span className="vps-distribution-offline" style={{ width: `${health.total ? (health.offline / health.total) * 100 : 0}%` }} />
         </div>
       </section>
+
+      {isSuperAdmin && <AgentKeyRolloutPanel servers={servers} />}
 
       <div className="vps-fleet-layout">
         <section className="vps-fleet-main" aria-labelledby="fleet-table-title">
@@ -440,7 +444,8 @@ export default function VpsView({
                               type="button"
                               className="vps-console-button"
                               onClick={() => handleServerSuperLogin(server)}
-                              title={`Open the Superclient console for ${server.name}`}
+                              disabled={!isSuperAdmin}
+                              title={isSuperAdmin ? `Open the Superclient console for ${server.name}` : 'Super Admin only'}
                             >
                               <Shield size={14} /><span>Console</span>
                             </button>

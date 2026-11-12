@@ -95,5 +95,32 @@ To deploy the fullstack application to your Linux/cPanel remote production serve
 
 ---
 
+## Encryption key backup
+
+Managed passwords are stored encrypted (`enc:v1:` values) with `PASSWORD_ENCRYPTION_KEY`. The database alone cannot reveal them, so the key must be backed up with the same care as the data.
+
+**Generate a key** (prints a 44-character base64 string):
+
+```bash
+node -e "console.log(require('crypto').randomBytes(32).toString('base64'))"
+```
+
+**Rules**
+
+- Store the key in at least two separate secure places: a password manager and an offline copy (for example a printed or encrypted USB copy kept in a safe).
+- Never store it in the repository, and never in the `BACKUP_DIR` that holds the database dumps. A dump and its key kept together defeat the encryption.
+- Losing the key makes every encrypted password unrecoverable. There is no reset.
+- Key rotation is NOT supported by the v1 format. The `enc:v1:` prefix leaves room for a future key id.
+
+**Test a restore (backup plus key together)**
+
+1. Restore a recent database backup into a scratch database (not the live one).
+2. Start the portal against that scratch database with the key from your backup copy.
+3. Reveal one client password in the portal and compare it with the known value.
+
+Run this test before the password migration (`scripts/migrate_passwords.js`) and after any change to your backup process.
+
+---
+
 ## 📄 License
 Proprietary & Confidential - Innovation Web Works. All Rights Reserved.
