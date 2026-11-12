@@ -1,0 +1,49 @@
+﻿# Render Blueprint: one Node web service for the portal backend (server.js).
+# Secrets use sync: false, so Render asks for them in the dashboard; they are never stored in this file.
+services:
+  - type: web
+    name: vps-software-house
+    runtime: node
+    plan: starter            # the free plan sleeps after 15 min idle and is not suitable for production
+    branch: dev
+    numInstances: 1          # the portal keeps state in memory: never run more than one instance
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORTAL_BASE_URL       # e.g. https://vps-software-house.onrender.com or your custom domain
+        sync: false
+      - key: PASSWORD_ENCRYPTION_KEY
+        sync: false
+      - key: SUPERADMIN_DEFAULT_PASS
+        sync: false
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "3306"
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: TRUSTED_PROXIES       # Render load balancer range; confirm before relying on client IPs
+        sync: false
+    # Voice notes and migration uploads are written under ./uploads, which Render wipes on every deploy.
+    # Uncomment to keep them (paid plans only; a disk also pins the service to one instance).
+    # disk:
+    #   name: uploads
+    #   mountPath: /opt/render/project/src/uploads
+    #   sizeGB: 1
