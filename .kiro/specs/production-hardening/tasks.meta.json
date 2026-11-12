@@ -4052,6 +4052,13 @@
         "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
         "timestamp": 1794474630688
       }
+    ],
+    "44.2 Remove the test workaround and add a test": [
+      {
+        "executionId": "449d6cfc-967b-46b1-baba-d7d9baf3c583",
+        "chatSessionId": "sess_ec1a9479-63f2-446e-bdd4-55bd6608917a",
+        "timestamp": 1794475773250
+      }
     ]
   }
 }
