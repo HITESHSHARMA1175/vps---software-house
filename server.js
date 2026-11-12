@@ -30,6 +30,7 @@ import { translateText } from './lib/translate.js';
 import { applyRateLimit, rateLimitKey as buildRateLimitKey } from './lib/rateLimit.js';
 import { sessionCookieOptions, sessionClearOptions } from './lib/sessionCookie.js';
 import { createHealthHandler } from './lib/health.js';
+import { buildMysqlSsl, connectTimeoutMs } from './lib/dbSsl.js';
 import { AsyncLocalStorage } from 'async_hooks';
 
 // Real-Time 0-Second Job Dispatcher (Option B: Instant Push Long-Polling)
@@ -743,23 +744,27 @@ async function initMySQLDatabase() {
   const dbUser = process.env.DB_USER || process.env.MYSQL_USER || 'root';
   const dbPass = process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || '';
   const dbName = process.env.DB_NAME || process.env.MYSQL_DATABASE || 'vps_db';
+  // Parsed once; invalid TLS/timeout settings throw a config error (fatal in production, see bootstrap).
+  const tcpSsl = buildMysqlSsl(process.env);
+  const tcpOpts = tcpSsl ? { ssl: tcpSsl } : {};
+  const dbConnectTimeout = connectTimeoutMs(process.env);
   const configsToTry = (process.platform === 'win32' || process.env.DB_SKIP_SOCKETS === '1')
-    ? [{ host: process.env.DB_HOST || process.env.MYSQL_HOST || '127.0.0.1', user: dbUser, password: dbPass, database: dbName, port: parseInt(process.env.DB_PORT || '3306', 10) }]
+    ? [{ host: process.env.DB_HOST || process.env.MYSQL_HOST || '127.0.0.1', user: dbUser, password: dbPass, database: dbName, port: parseInt(process.env.DB_PORT || '3306', 10), ...tcpOpts }]
     : [
         { socketPath: '/run/mysqld/mysqld.sock', user: dbUser, password: dbPass, database: dbName },
         { socketPath: '/var/lib/mysql/mysql.sock', user: dbUser, password: dbPass, database: dbName },
         { socketPath: '/tmp/mysql.sock', user: dbUser, password: dbPass, database: dbName },
-        { host: process.env.DB_HOST || process.env.MYSQL_HOST || '127.0.0.1', user: dbUser, password: dbPass, database: dbName },
+        { host: process.env.DB_HOST || process.env.MYSQL_HOST || '127.0.0.1', user: dbUser, password: dbPass, database: dbName, port: parseInt(process.env.DB_PORT || '3306', 10), ...tcpOpts },
         { socketPath: '/run/mysqld/mysqld.sock', user: dbUser, database: dbName }
       ];
 
   for (const cfg of configsToTry) {
     try {
-      dbPool = mysql.createPool({ ...cfg, waitForConnections: true, connectionLimit: 10, connectTimeout: 1000 });
+      dbPool = mysql.createPool({ ...cfg, waitForConnections: true, connectionLimit: 10, connectTimeout: dbConnectTimeout });
       await dbPool.query('SELECT 1');
       wrapDbPool(dbPool);
       isMysqlConnected = true;
-      console.log(`âœ… Fully Functional MariaDB/MySQL Database Connected: ${dbName} via ${cfg.socketPath ? 'Unix Socket (' + cfg.socketPath + ')' : 'TCP'}`);
+      console.log(`âœ… Fully Functional MariaDB/MySQL Database Connected: ${dbName} via ${cfg.socketPath ? 'Unix Socket (' + cfg.socketPath + ')' : 'TCP'} | TLS: ${cfg.ssl ? 'on' : 'off'}`);
       break;
     } catch (e) {
       dbPool = null;
@@ -10164,6 +10169,10 @@ async function bootstrap(deps = {}) {
   try {
     await initDatabase();
   } catch (e) {
+    if (e && e.code === 'DB_SSL_CONFIG') {
+      console.error('[Config] Invalid MySQL TLS settings: ' + e.message);
+      if (cfg.isProduction) process.exit(1);
+    }
     console.error('[DB] init failed:', e && e.message);
     if (strictMysql) failStartup('MySQL initialization failed');
   }

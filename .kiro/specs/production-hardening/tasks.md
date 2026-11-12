@@ -1232,6 +1232,21 @@ Task order: 54 (key rotation grace window, resolves Open Issue 2), 55 (PHP proxy
     - _Requirements: 24.4_
     - Change_Report: `src/components/LoginScreen.jsx`, `src/components/ForgotPasswordModal.jsx` (modified). Verify: `npx vite build` succeeds; clicking the eye shows the typed text and clicking again hides it; pressing Enter in the field still submits the form.
 
+- [ ] 61. MySQL TLS for managed databases (Aiven)
+  - [x] 61.1 Add verified TLS and a configurable connect timeout to every MySQL connection
+    - New `lib/dbSsl.js`: `buildMysqlSsl(env)` returns `undefined` when TLS is off, else `{ ca, rejectUnauthorized: true }`; TLS is on when `DB_SSL` is `1`/`true`/`required` or a CA is given; the CA comes from `DB_SSL_CA` (PEM text, literal `\n` sequences turned into newlines), `DB_SSL_CA_BASE64`, or `DB_SSL_CA_FILE` (path); `DB_SSL=1` without a CA, an unreadable file, or text that is not a PEM certificate throws a config error naming the variable (never the value); verification is never disabled. `connectTimeoutMs(env)` reads `DB_CONNECT_TIMEOUT_MS` (integer 1000..120000, default 10000)
+    - `server.js` `initMySQLDatabase`: apply `ssl` and the timeout to the TCP connection candidates (not Unix sockets); log only whether TLS is on, never the CA; fail startup clearly in production when the TLS settings are invalid
+    - `scripts/migrate_passwords.js`: use the same `ssl` and timeout (keep its 30 s default when `DB_CONNECT_TIMEOUT_MS` is unset)
+    - `.env.example` and `render.yaml`: add `DB_SSL`, `DB_SSL_CA` / `DB_SSL_CA_BASE64` / `DB_SSL_CA_FILE`, `DB_CONNECT_TIMEOUT_MS` with placeholders
+    - _Requirements: 11.1, 7.13_
+    - Change_Report: `lib/dbSsl.js` (added), `server.js`, `scripts/migrate_passwords.js`, `.env.example`, `render.yaml` (modified). Verify: unit tests in 61.2 pass; with `DB_SSL=1` and a CA the pool options contain `ssl.ca` and `rejectUnauthorized: true`.
+
+  - [ ] 61.2 Write tests for the TLS options
+    - `buildMysqlSsl`: off by default; each CA source; literal `\n` handling; `DB_SSL=1` without CA throws naming `DB_SSL_CA`; non-PEM text throws; error messages never contain the CA text; `rejectUnauthorized` is always true. `connectTimeoutMs`: default, valid, out-of-range
+    - `initMySQLDatabase` against the fake MySQL with `DB_SSL=1` and a test CA: the pool options received by `createPool` include `ssl` and the configured `connectTimeout`; without TLS settings they do not include `ssl`
+    - _Requirements: 11.1_
+    - Change_Report: `tests/dbSsl.test.js` (added). Verify: passes.
+
 ## Notes
 
 - Tasks marked with `*` are optional and can be skipped for a faster MVP

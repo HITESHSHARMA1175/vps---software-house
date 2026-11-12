@@ -13,10 +13,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import * as mysqlModule from 'mysql2/promise';
 import { parseKey, sealPassword, isCiphertext } from '../lib/secretCipher.js';
 import { sealTotpSecret } from '../lib/totpSecrets.js';
+import { buildMysqlSsl } from '../lib/dbSsl.js';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const JSON_PATH = path.join(ROOT, 'database.json');
-const CONNECT_TIMEOUT_MS = 30000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 30000;
 const PASSWORD_WIDTH = 2048;
 const TOTP_WIDTH = 512;
 
@@ -83,13 +84,20 @@ function timestamp(d = new Date()) {
 
 function connectionConfig(env) {
   const pick = (a, b, d) => env[a] ?? env[b] ?? d;
+  const ssl = buildMysqlSsl(env);
+  const rawTimeout = String(env.DB_CONNECT_TIMEOUT_MS ?? '').trim();
+  const timeout = rawTimeout === '' ? DEFAULT_CONNECT_TIMEOUT_MS : Number(rawTimeout);
+  if (!Number.isInteger(timeout) || timeout < 1000 || timeout > 120000) {
+    throw new Error('DB_CONNECT_TIMEOUT_MS must be an integer between 1000 and 120000');
+  }
   return {
     host: pick('DB_HOST', 'MYSQL_HOST', 'localhost'),
     port: Number(pick('DB_PORT', 'MYSQL_PORT', 3306)),
     user: pick('DB_USER', 'MYSQL_USER', 'root'),
     password: pick('DB_PASSWORD', 'MYSQL_PASSWORD', ''),
     database: pick('DB_NAME', 'MYSQL_DATABASE', undefined) ?? env.MYSQL_DB,
-    connectTimeout: CONNECT_TIMEOUT_MS,
+    connectTimeout: timeout,
+    ...(ssl ? { ssl } : {}),
   };
 }
 
